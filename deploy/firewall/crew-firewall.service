@@ -1,0 +1,26 @@
+[Unit]
+Description=Crew sandbox network isolation
+# Ordered after Docker (DOCKER-USER must exist) but NOT Wants=docker.service:
+# this unit runs every 60 s and must never start a dockerd the operator
+# stopped on purpose.
+After=docker.service
+# Bounded, not unlimited. Nothing but the timer starts this
+# unit since the spool and its .path unit are gone, so the ceiling is
+# now only a guard against a stuck loop rather than against flooding.
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/crew-firewall.sh
+# The script does reads and insert-if-missing writes only; 30 s is generous.
+TimeoutStartSec=30s
+
+[Install]
+# Enabled as a boot-time unit too (install.sh): the rules go in once, right
+# after docker.service, instead of at the timer's first tick — projects with
+# restart policy unless-stopped come back up at daemon start, and the window
+# between that and the first tick was ≤15 s of an unconfined sdb- bridge.
+# Still no Wants=docker.service:
+# this unit must never start a dockerd the operator stopped on purpose.
+WantedBy=multi-user.target

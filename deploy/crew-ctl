@@ -1,0 +1,2577 @@
+#!/usr/bin/env bash
+# crew-ctl: installs, checks, changes, and removes Crew on a machine (design 16.11).
+#
+#   sudo deploy/crew-ctl doctor [--env-file FILE] [--json]
+#   sudo deploy/crew-ctl install --build [--env-file FILE]
+#   sudo deploy/crew-ctl install --from FOLDER    a release folder: on a running Crew, a build by hand
+#   sudo deploy/crew-ctl install --from CARD --registry HOST/PATH --registry-token-file FILE   another machine's first install (16.12)
+#   sudo deploy/crew-ctl install --upgrade-runtime   the newer machine setup a release needs, from this checkout
+#   sudo crew-ctl install --deploy-files [--version X.Y.Z]   crew-ctl and its files of the running release, checked
+#   sudo deploy/crew-ctl build --version X.Y.Z [--title TEXT] [--out DIR]   a release folder of this checkout's commit (16.10)
+#   sudo deploy/crew-ctl gate X.Y.Z               the gate on a release folder (16.2)
+#   sudo crew-ctl update [--version X.Y.Z] | rollback [--version X.Y.Z] [--confirm X.Y.Z]
+#   sudo crew-ctl status [--json]
+#   sudo crew-ctl edit KEY=VALUE...
+#   sudo crew-ctl logs [server|ingress|db|updater] [-f]
+#   sudo crew-ctl uninstall --level 1|2|3 [--with-runtime]
+#   sudo crew-ctl migrate | backup | restore FILE | settings export | settings import FILE | db shell | proof | selftest
+#   sudo crew-ctl pause | resume      Pause all, and Resume, when the app cannot be opened (7.9)
+#   sudo crew-ctl restart-if-quiet    crew-restart.timer's: restarts the machine for security updates when the server says so (16.10)
+#   sudo crew-ctl project ls | project export NAME DIR | project import DIR [--name NAME] [--key KEY]
+#   sudo crew-ctl release card X.Y.Z [--out DIR]    a release without its images, for another machine (16.12)
+#   sudo crew-ctl release pull CARD --registry HOST/PATH --registry-token-file FILE | release import FOLDER
+#
+# Every verb takes --dry-run, which prints each command that would change something and runs none.
+# --yes takes the defaults, and --confirm WORD gives the word a destructive step asks for.
+#
+# It does the machine's part. Crew's data is read and written only by `crew admin`, which this
+# script runs in a container of the server's image (16.11). It needs only bash, coreutils, and
+# python3 for JSON, which the host setup installs.
+set -euo pipefail
+shopt -s inherit_errexit
+
+# ─── Paths ──────────────────────────────────────────────────────────────────
+# Overridable for the tests only: under sudo -E a path in the environment would otherwise choose
+# what root writes and deletes, so outside the tests an override is refused.
+ETC_DIR="${CREW_CTL_ETC_DIR:-/etc/crew}"
+LIB_DIR="${CREW_CTL_LIB_DIR:-/usr/local/lib/crew}"
+SBIN_DIR="${CREW_CTL_SBIN_DIR:-/usr/local/sbin}"
+UNIT_DIR="${CREW_CTL_UNIT_DIR:-/etc/systemd/system}"
+# The updater's socket (16.11): only root and the server's container open it.
+UPDATER_SOCK="${CREW_CTL_UPDATER_SOCK:-/run/crew/updater.sock}"
+# What a kernel update writes when the machine needs a restart (16.10), and the lock an install and an
+# uninstall hold, so the timer's restart never comes in the middle of one. It is in /run itself, where
+# only root makes files: in /run/lock any user could hold it, and silence the restart (security review
+# of 398035b..31089ee).
+REBOOT_REQUIRED="${CREW_CTL_REBOOT_REQUIRED:-/var/run/reboot-required}"
+CTL_LOCK="${CREW_CTL_LOCK:-/run/crew-ctl.lock}"
+# A restart that waited longer than this, a day past the server's 7 (16.10), fails restart-if-quiet.
+RESTART_DAYS=8
+if [ "${CREW_CTL_TEST:-}" != 1 ]; then
+    for _ov in CREW_CTL_ETC_DIR CREW_CTL_LIB_DIR CREW_CTL_SBIN_DIR CREW_CTL_UNIT_DIR CREW_CTL_UPDATER_SOCK CREW_CTL_REBOOT_REQUIRED CREW_CTL_LOCK; do
+        [ -z "${!_ov:-}" ] || { echo "crew-ctl: ERROR ${_ov} is for the tests only; unset it" >&2; exit 1; }
+    done
+fi
+ENV_FILE="${ETC_DIR}/crew.env"
+SECRETS_DIR="${ETC_DIR}/secrets"
+INSTALL_JSON="${ETC_DIR}/install.json"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Run from a checkout, the deploy files are beside this script; installed, they are in LIB_DIR.
+if [ -f "${SELF_DIR}/compose.yaml" ]; then DEPLOY="${SELF_DIR}"; else DEPLOY="${LIB_DIR}"; fi
+# versions.lock is at the root of a checkout, and beside the deploy files once installed.
+LOCK="${DEPLOY}/versions.lock"; [ -f "${LOCK}" ] || LOCK="${DEPLOY}/../versions.lock"
+
+DRY=0 YES=0 JSON=0 CONFIRM_GIVEN="" ENV_IN="" BUILD=0 UPGRADE=0 DEPLOY_FILES=0 LEVEL="" WITH_RUNTIME=0 FOLLOW=0 PROJECT_NAME="" PROJECT_KEY=""
+FROM_DIR="" VERSION_ARG="" TITLE_ARG="" REGISTRY="" REG_TOKEN_FILE="" REG_TOKEN_ARG="" OUT_DIR=""
+SECRETS=(db_postgres db_crew db_crew_migrate db_crew_read ingress_token jwt_key)
+# The secrets of the answers file, also written as files for the ingress's Docker secrets.
+ANSWER_SECRETS=(google_client_secret:GOOGLE_CLIENT_SECRET cloudflare_api_token:CLOUDFLARE_API_TOKEN)
+UNITS=(crew-firewall.service crew-firewall.timer crew-restart.service crew-restart.timer)
+# The settings of the machine's own security updates that the host setup writes (16.10).
+APT_FILES=(/etc/apt/apt.conf.d/52crew-unattended-upgrades /etc/apt/apt.conf.d/21crew-auto-upgrades)
+CONTAINERS=(crew-caddy crew-server crew-updater crew-db)
+
+log()  { echo "==> $*"; }
+warn() { echo "==> WARNING: $*" >&2; }
+die()  { echo "crew-ctl: ERROR $*" >&2; exit 1; }
+# Every change goes through run(): --dry-run prints it and does nothing.
+run()  { if [ "${DRY}" = 1 ]; then echo "+ $*"; else "$@"; fi; }
+# In the tests every tool crew-ctl calls is a fake and every path a scratch folder, so they run it
+# without root.
+need_root() { [ "${DRY}" = 1 ] || [ "${CREW_CTL_TEST:-}" = 1 ] || [ "$(id -u)" = 0 ] || die "run as root (sudo), or pass --dry-run"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+# ctl_lock [nowait]: holds CTL_LOCK until crew-ctl ends, and marks the time it was taken. An install
+# and an uninstall wait for each other, at most 10 minutes; restart-if-quiet takes it only when it is
+# free.
+ctl_lock() {
+    [ "${DRY}" = 1 ] && return 0
+    have flock || return 0
+    [ -L "${CTL_LOCK}" ] && die "${CTL_LOCK} is a link"
+    local um; um="$(umask)"
+    umask 077
+    exec 8>>"${CTL_LOCK}" || { umask "${um}"; die "cannot open ${CTL_LOCK}"; }
+    umask "${um}"
+    # One that was there already is root's own, and no one else's to read or hold open again.
+    [ "$(stat -L -c %u /proc/self/fd/8 2>/dev/null || stat -c %u "${CTL_LOCK}")" = "$(id -u)" ] || die "${CTL_LOCK} is not root's"
+    chmod 0600 "${CTL_LOCK}"
+    if [ "${1:-}" = nowait ]; then flock -n 8 || return 1
+    else flock -w 600 8 || die "another crew-ctl install or uninstall has held ${CTL_LOCK} for 10 minutes"; fi
+    touch "${CTL_LOCK}"
+}
+printable() { printf '%s' "$1" | tr -d '\000-\037\177'; }
+has_tty() { ( : < /dev/tty ) 2>/dev/null; }
+
+# ─── The answers (16.11) ────────────────────────────────────────────────────
+KEYS_REQUIRED=(CREW_HOSTNAME CREW_ADMIN_EMAIL GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET)
+KEYS_OPTIONAL=(CREW_APPS_DOMAIN CLOUDFLARE_API_TOKEN CREW_TLS CREW_DATA_DIR CREW_TIMEZONE CREW_SOURCE_REPO CREW_ALLOW_IP_FORWARD)
+SECRET_KEYS=" GOOGLE_CLIENT_SECRET CLOUDFLARE_API_TOKEN "
+
+is_key() { [[ "$1" =~ ^[A-Z][A-Z0-9_]*$ ]]; }
+is_hostname() { [[ "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]] && [ "${#1}" -le 253 ]; }
+is_email() { [[ "$1" =~ ^[^[:space:]@,]+@[^[:space:]@,]+\.[^[:space:]@,]+$ ]]; }
+known_key() { local k; for k in "${KEYS_REQUIRED[@]}" "${KEYS_OPTIONAL[@]}"; do [ "$k" = "$1" ] && return 0; done; return 1; }
+masked() { case "${SECRET_KEYS}" in *" $1 "*) [ -n "$2" ] && echo "********" || echo "" ;; *) printable "$2" ;; esac; }
+
+# registered_domain NAME: the last two labels, or three under a public suffix of two labels.
+# The address Google sends the sign-in back to. The client must list it exactly, and doctor, the
+# questions, and install all say it.
+redirect_address() { echo "https://auth.${A_CREW_HOSTNAME}/oauth2/google/authorization-code-callback"; }
+# Hosted projects sign in at the apps domain's own portal (19.4): the client lists its address too.
+apps_redirect_address() { echo "https://auth.${A_CREW_APPS_DOMAIN}/oauth2/google/authorization-code-callback"; }
+apps_redirect() { [ -z "${A_CREW_APPS_DOMAIN:-}" ] || echo ", and for hosted projects $(apps_redirect_address)"; }
+
+registered_domain() {
+    local n="$1" two three
+    two="$(echo "$n" | awk -F. '{print $(NF-1)"."$NF}')"
+    three="$(echo "$n" | awk -F. 'NF>=3 {print $(NF-2)"."$(NF-1)"."$NF}')"
+    case "${two}" in
+        co.uk|org.uk|ac.uk|com.au|net.au|org.au|co.nz|co.jp|com.br|co.za|com.se) echo "${three:-$n}" ;;
+        *) echo "${two}" ;;
+    esac
+}
+
+# validate KEY VALUE: 0, or 1 with the reason on stderr.
+validate() {
+    local k="$1" v="$2"
+    [[ "${v}" =~ [[:cntrl:]] ]] && { echo "${k}: control characters are refused" >&2; return 1; }
+    # No $ { } \ or space: Compose reads the install file and would rewrite a value with ${.
+    [[ -z "${v}" || "${v}" =~ ^[^[:space:]\$\{\}\\\'\"]+$ ]] || { echo "${k}: no spaces, quotes, \$, {, }, or \\" >&2; return 1; }
+    case "${k}" in
+        CREW_HOSTNAME) is_hostname "${v}" || { echo "${k}: not a host name such as crew.example.com" >&2; return 1; } ;;
+        CREW_APPS_DOMAIN) [ -z "${v}" ] || is_hostname "${v}" || { echo "${k}: not a domain" >&2; return 1; } ;;
+        CREW_ADMIN_EMAIL) is_email "${v}" || { echo "${k}: not a mail address" >&2; return 1; } ;;
+        GOOGLE_CLIENT_ID) [ -z "${v}" ] || [[ "${v}" =~ \.apps\.googleusercontent\.com$ ]] || { echo "${k}: a Google client id ends in .apps.googleusercontent.com" >&2; return 1; } ;;
+        GOOGLE_CLIENT_SECRET|CLOUDFLARE_API_TOKEN) : ;;
+        CREW_TLS) case "${v}" in ''|acme|staging|internal) ;; *) echo "${k}: acme, staging, or internal" >&2; return 1 ;; esac ;;
+        CREW_DATA_DIR) [ -z "${v}" ] || [[ "${v}" =~ ^/[a-zA-Z0-9._/-]+$ && "${v}" != *..* ]] || { echo "${k}: an absolute path" >&2; return 1; } ;;
+        CREW_TIMEZONE) [ -z "${v}" ] || [[ "${v}" =~ ^[A-Za-z_]+(/[A-Za-z0-9_+-]+)*$ ]] || { echo "${k}: a time zone such as Europe/Stockholm" >&2; return 1; } ;;
+        CREW_SOURCE_REPO) [ -z "${v}" ] || [[ "${v}" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || { echo "${k}: owner/name" >&2; return 1; } ;;
+        CREW_ALLOW_IP_FORWARD) case "${v}" in ''|1) ;; *) echo "${k}: 1, or empty" >&2; return 1 ;; esac ;;
+        *) echo "${k}: not a key of the install file" >&2; return 1 ;;
+    esac
+}
+
+env_get() { # env_get FILE KEY: the value, '' if absent; the last line wins, as for Compose
+    local file="$1" key="$2"
+    is_key "${key}" || die "not a key: ${key}"
+    [ -f "${file}" ] || return 0
+    awk -v k="${key}" 'index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { if (v != "") print v }' "${file}"
+}
+
+# The answers, read into A_<KEY>, from --env-file, else the file an earlier install left, else asked.
+load_answers() {
+    local src="" k v
+    if [ -n "${ENV_IN}" ]; then src="${ENV_IN}"; [ -r "${src}" ] || die "cannot read ${src}"
+    elif [ -f "${ENV_FILE}" ]; then src="${ENV_FILE}"; fi
+    for k in "${KEYS_REQUIRED[@]}" "${KEYS_OPTIONAL[@]}"; do
+        v=""; [ -n "${src}" ] && v="$(env_get "${src}" "${k}")"
+        printf -v "A_${k}" '%s' "${v}"
+    done
+    [ -n "${A_CREW_TLS}" ] || A_CREW_TLS=acme
+    [ -n "${A_CREW_DATA_DIR}" ] || A_CREW_DATA_DIR=/var/lib/crew
+    if [ -z "${src}" ]; then
+        ask_answers
+    fi
+}
+
+ask() { # ask VAR PROMPT [secret]
+    local _var="$1" _prompt="$2" _secret="${3:-}" _v=""
+    { [ "${YES}" = 1 ] || ! has_tty; } && die "no answers file: pass --env-file (see .env.example)"
+    if [ -n "${_secret}" ]; then read -rs -p "${_prompt}: " _v < /dev/tty; echo; else read -r -p "${_prompt}: " _v < /dev/tty; fi
+    printf -v "${_var}" '%s' "${_v}"
+}
+
+ask_answers() {
+    log "no answers file: one question at a time (.env.example explains each)"
+    ask A_CREW_HOSTNAME "The address Crew is opened at, such as crew.example.com"
+    ask A_CREW_ADMIN_EMAIL "The Google account that may sign in"
+    ask A_CREW_TLS "Certificates: acme, staging, or internal"
+    [ -n "${A_CREW_TLS}" ] || A_CREW_TLS=acme
+    if [ "${A_CREW_TLS}" != internal ]; then
+        ask A_GOOGLE_CLIENT_ID "The Google sign-in client's id (it must list the redirect address $(redirect_address)$(apps_redirect))"
+        ask A_GOOGLE_CLIENT_SECRET "The Google sign-in client's secret" secret
+        ask A_CLOUDFLARE_API_TOKEN "A Cloudflare DNS token (empty: you set the DNS records yourself)" secret
+    fi
+}
+
+# check_answers: every problem with the answers, as lines of "fail: ..." on stdout.
+check_answers() {
+    local k v
+    for k in "${KEYS_REQUIRED[@]}"; do
+        v="A_${k}"; v="${!v}"
+        if [ -z "${v}" ]; then
+            # A test machine with certificates of its own needs no sign-in client (16.11).
+            case "${k}" in GOOGLE_CLIENT_*) [ "${A_CREW_TLS}" = internal ] && continue ;; esac
+            echo "fail: ${k} must be given"; continue
+        fi
+    done
+    for k in "${KEYS_REQUIRED[@]}" "${KEYS_OPTIONAL[@]}"; do
+        v="A_${k}"; v="${!v}"
+        [ -n "${v}" ] || continue
+        validate "${k}" "${v}" 2>&1 | sed 's/^/fail: /' || true
+    done
+    if [ -n "${A_CREW_APPS_DOMAIN}" ] && [ -n "${A_CREW_HOSTNAME}" ]; then
+        local a="${A_CREW_APPS_DOMAIN,,}" c="${A_CREW_HOSTNAME,,}"
+        a="${a%.}"; c="${c%.}"
+        if [ "${a}" = "${c}" ] || [[ "${c}" == *".${a}" ]] || [[ "${a}" == *".${c}" ]]; then
+            echo "fail: CREW_APPS_DOMAIN must not be CREW_HOSTNAME or a domain under or over it (design 19.4); leave it empty if you do not host projects"
+        fi
+    fi
+}
+
+# ─── Doctor (16.11) ─────────────────────────────────────────────────────────
+DOC_RESULTS=()
+doc() { DOC_RESULTS+=("$1|$2|$3"); }   # doc STATUS CHECK DETAIL; STATUS is ok, warn, fail, or skip
+
+# After uninstall level 2 the kept crew-ctl has no versions.lock: a value is then empty.
+lock_value() { [ -f "${LOCK}" ] || return 0; sed -n "s/^$1=//p" "${LOCK}" | tail -1; }
+
+doctor_machine() {
+    local os="" id="" ver="" cores mem_gb disk_gb p port_users
+    if [ -r /etc/os-release ]; then
+        id="$(. /etc/os-release && echo "${ID:-}")"; ver="$(. /etc/os-release && echo "${VERSION_ID:-}")"
+        os="$(. /etc/os-release && echo "${PRETTY_NAME:-}")"
+    fi
+    case "${id}" in
+        debian) if [ "${ver%%.*}" -ge 13 ] 2>/dev/null; then doc ok system "${os}"; else doc fail system "${os}: Debian 13 or later"; fi ;;
+        ubuntu) if [ "${ver%%.*}" -ge 24 ] 2>/dev/null; then doc ok system "${os}"; else doc fail system "${os}: Ubuntu 24.04 or later"; fi ;;
+        *) doc fail system "${os:-unknown}: Crew installs on Debian or Ubuntu only" ;;
+    esac
+    [ "$(uname -m)" = x86_64 ] || doc fail system "$(uname -m): AMD64 only"
+    if [ -e /dev/kvm ]; then doc ok virtualization "/dev/kvm present"
+    else doc fail virtualization "/dev/kvm is missing: bare metal, or a virtual machine with nested virtualization"; fi
+
+    cores="$(nproc)"
+    # In GB as a label gives them (10^9 bytes): a machine sold as 64 GB passes the 64 GB line.
+    mem_gb="$(awk '/MemTotal/ {printf "%d", $2*1024/1e9 + 0.5}' /proc/meminfo)"
+    p="${A_CREW_DATA_DIR:-/var/lib/crew}"; while [ ! -d "${p}" ]; do p="$(dirname "${p}")"; done
+    disk_gb="$(df -Pk "${p}" | awk 'NR==2 {printf "%d", $4/1024/1024}')"
+    if [ "${cores}" -lt 8 ] || [ "${mem_gb}" -lt 32 ] || [ "${disk_gb}" -lt 200 ]; then
+        doc fail room "${cores} threads, ${mem_gb} GB, ${disk_gb} GB free: at least 8, 32 GB, and 200 GB"
+    elif [ "${cores}" -lt 16 ] || [ "${mem_gb}" -lt 64 ]; then
+        doc warn room "${cores} threads, ${mem_gb} GB, ${disk_gb} GB free: below 16 and 64 GB, fewer sandboxes fit"
+    else doc ok room "${cores} threads, ${mem_gb} GB, ${disk_gb} GB free"; fi
+
+    for port in 80 443; do
+        port_users="$({ ss -Hltnp "sport = :${port}" 2>/dev/null || true; } | { grep -oE 'users:\(\("[^"]+"' || true; } | sed 's/users:(("//' | sort -u | tr '\n' ' ')"
+        if [ -z "${port_users}" ]; then doc ok "port ${port}" "free"
+        elif [[ "${port_users}" == *docker-proxy* ]] && have docker && docker ps --format '{{.Names}}' 2>/dev/null | grep -x crew-caddy >/dev/null; then
+            doc ok "port ${port}" "Crew's ingress"
+        else doc fail "port ${port}" "taken by ${port_users}"; fi
+    done
+
+    local url
+    for url in https://github.com https://download.docker.com https://accounts.google.com https://registry-1.docker.io/v2/; do
+        if curl -sS -o /dev/null --max-time 10 "${url}" 2>/dev/null; then doc ok network "reaches ${url}"
+        else doc fail network "cannot reach ${url}"; fi
+    done
+    local date_hdr remote now
+    date_hdr="$(curl -sSI --max-time 10 https://www.google.com 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="date" {print $2}')"
+    if [ -n "${date_hdr}" ] && remote="$(date -d "${date_hdr}" +%s 2>/dev/null)"; then
+        now="$(date +%s)"
+        if [ $(( now > remote ? now - remote : remote - now )) -gt 30 ]; then doc fail clock "off by more than 30 seconds"
+        else doc ok clock "in time"; fi
+    else doc warn clock "could not be compared"; fi
+
+    # What is already there: styrman-crew's running parts fail, its leftovers warn (17.6).
+    if have docker && docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^styrman' >/dev/null; then
+        doc fail "already there" "containers of styrman-crew"
+    fi
+    if have systemctl && systemctl list-unit-files 'styrman*' 2>/dev/null | grep styrman >/dev/null; then
+        doc fail "already there" "units of styrman-crew"
+    fi
+    if have iptables && iptables -S 2>/dev/null | grep -- '-N STYRMAN' >/dev/null; then
+        doc fail "already there" "firewall chains of styrman-crew"
+    fi
+    [ -d /var/lib/styrman ] && doc warn "already there" "styrman-crew's data folder /var/lib/styrman, left by its uninstall"
+
+    # Docker and Kata: another major version than versions.lock fails, another minor warns.
+    local want have_v
+    if [ ! -f "${LOCK}" ]; then
+        doc skip versions "no versions.lock here: run doctor from a checkout to compare Docker's and Kata's versions"
+        return 0
+    fi
+    if have docker; then
+        want="$(lock_value DOCKER_VERSION)"; have_v="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+        if [ -z "${have_v}" ]; then doc fail docker "installed, but its daemon does not answer"
+        elif [ "${have_v%%.*}" != "${want%%.*}" ]; then doc fail docker "${have_v}, not ${want}'s major version: crew-ctl install --upgrade-runtime replaces it"
+        elif [ "${have_v}" != "${want}" ]; then doc warn docker "${have_v}, not ${want}: left as it is"
+        else doc ok docker "${have_v}"; fi
+    else doc ok docker "not installed: install puts ${DOCKER_VERSION:-$(lock_value DOCKER_VERSION)} in"; fi
+    doctor_kata /etc/docker/daemon.json "" /proc "$(lock_value KATA_VERSION)"
+}
+
+# doctor_kata DAEMON_JSON ROOT PROC WANT: the Kata Docker's runtime mvm starts (13.2). An older one is no
+# failure: install moves it to versions.lock's, beside it, and the runtime switches after its proof
+# (since 0.68). Paths are arguments for the tests.
+doctor_kata() {
+    local daemon="$1" root="$2" proc="$3" want="$4" have_v
+    # shellcheck source=lib/kata-config.sh
+    source "${DEPLOY}/lib/kata-config.sh"
+    if have_v="$(kata_in_use "${daemon}" "${root}")"; then
+        have_v="${have_v%% *}"
+        if [ "${have_v}" = "${want}" ]; then doc ok kata "${have_v}"
+        elif kata_older "${have_v}" "${want}"; then doc ok kata "${have_v}: install moves it to ${want}, beside it, and switches after its proof"
+        else doc warn kata "${have_v}, newer than ${want}: left as it is"; fi
+    elif [ -e "${root}/opt/kata" ] || compgen -G "${root}/opt/kata-[0-9]*" >/dev/null; then
+        doc warn kata "Docker's runtime mvm starts no Kata that crew-ctl knows: install puts ${want} in"
+    else doc ok kata "not installed: install puts ${want} in"; fi
+    # 3.31's folder that Crew did not install, once nothing runs from it, is the operator's to remove.
+    if [ -d "${root}/opt/kata" ] && ! kata_named "${daemon}" "${root}/opt/kata" "${root}" \
+        && ! kata_ours | grep -xF /opt/kata >/dev/null && ! kata_busy "${root}/opt/kata" "${proc}" >/dev/null; then
+        doc warn kata "/opt/kata is no longer used, and Crew did not install it: remove it by hand if nothing else needs it"
+    fi
+}
+
+# kata_ours: the folders of Kata that install.json says Crew put on the machine, one per line, which the
+# host setup alone may remove (13.2): those it unpacked (kata_dirs), and 3.31's /opt/kata when Crew
+# installed that one. install.json is root's own; the host setup checks each line's shape again.
+kata_ours() {
+    [ -f "${INSTALL_JSON}" ] || return 0
+    python3 -I -c 'import json,sys
+m = json.load(open(sys.argv[1])).get("machine", {})
+ds = [d for d in m.get("kata_dirs", []) if isinstance(d, str) and "\n" not in d]
+if m.get("kata", "").startswith("installed 3.") and "/opt/kata" not in ds and "/opt/kata" not in m.get("kata_dirs_gone", []):
+    ds.append("/opt/kata")
+print("\n".join(ds))' "${INSTALL_JSON}" 2>/dev/null || true
+}
+
+doctor_answers() {
+    local line
+    while IFS= read -r line; do [ -n "${line}" ] && doc fail answers "${line#fail: }"; done < <(check_answers)
+    [ "${#DOC_RESULTS[@]}" -gt 0 ] && printf '%s\n' "${DOC_RESULTS[@]}" | grep '^fail|answers' >/dev/null && return 0
+    doc ok answers "every key is given and has its form"
+
+    if [ "${A_CREW_TLS}" = internal ]; then
+        doc skip names "CREW_TLS=internal: the names and the sign-in client are not checked"
+        return 0
+    fi
+    # The names point at this machine, unless the ingress may write them.
+    local ip name resolved names=("${A_CREW_HOSTNAME}" "auth.${A_CREW_HOSTNAME}")
+    [ -z "${A_CREW_APPS_DOMAIN:-}" ] || names+=("auth.${A_CREW_APPS_DOMAIN}")
+    ip="$(curl -sS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    for name in "${names[@]}"; do
+        resolved="$(getent ahostsv4 "${name}" 2>/dev/null | awk '!f {print $1; f = 1}')"
+        if [ -n "${ip}" ] && [ "${resolved}" = "${ip}" ]; then doc ok names "${name} points at this machine (${ip})"
+        elif [ -n "${A_CLOUDFLARE_API_TOKEN}" ]; then doc ok names "${name} is ${resolved:-not set}: the ingress writes it with the DNS token"
+        else doc fail names "${name} is ${resolved:-not set}, this machine is ${ip:-unknown}, and there is no DNS token"; fi
+    done
+    # The sign-in client: a made-up code is refused as a wrong code by a client Google knows, and
+    # as an unknown client otherwise; then Google's sign-in page is asked with each redirect address
+    # so a missing redirect address (redirect_uri_mismatch) fails here.
+    local answer redirect uri redirects=() ok=1
+    redirect="$(redirect_address)"
+    redirects+=("${redirect}")
+    [ -z "${A_CREW_APPS_DOMAIN:-}" ] || redirects+=("$(apps_redirect_address)")
+    # The secret goes to curl in its configuration on standard input, never on its command line.
+    answer="$(printf 'data-urlencode = "client_secret=%s"\n' "${A_GOOGLE_CLIENT_SECRET}" \
+        | curl -sS --max-time 10 --config - -X POST https://oauth2.googleapis.com/token \
+        --data-urlencode "code=crew-doctor-check" --data-urlencode "client_id=${A_GOOGLE_CLIENT_ID}" \
+        --data-urlencode "redirect_uri=${redirect}" \
+        --data-urlencode "grant_type=authorization_code" 2>/dev/null || true)"
+    case "${answer}" in
+        *invalid_grant*)
+            local body code
+            for uri in "${redirects[@]}"; do
+                answer="$(curl -sSLG --max-time 10 -w $'\n%{http_code}' https://accounts.google.com/o/oauth2/v2/auth \
+                    --data-urlencode "client_id=${A_GOOGLE_CLIENT_ID}" \
+                    --data-urlencode "redirect_uri=${uri}" \
+                    --data-urlencode "response_type=code" \
+                    --data-urlencode "scope=openid email profile" 2>/dev/null || true)"
+                code="${answer##*$'\n'}"
+                body="${answer%$'\n'*}"
+                if [[ "${body}" == *redirect_uri_mismatch* ]]; then
+                    doc fail "sign-in client" "Google refuses the redirect address ${uri} (redirect_uri_mismatch): add it to the sign-in client in Google Cloud Console"
+                    ok=0
+                elif [[ "${code}" == 4* ]]; then
+                    doc fail "sign-in client" "Google refuses the sign-in request for ${uri} (HTTP ${code})"
+                    ok=0
+                elif [ "${code}" != 200 ] || [ -z "${body}" ]; then
+                    doc warn "sign-in client" "Google gave no answer for the redirect address ${uri}"
+                    ok=0
+                fi
+            done
+            [ "${ok}" = 0 ] || doc ok "sign-in client" "Google knows it; it lists the redirect address ${redirect}$(apps_redirect)"
+            ;;
+        *invalid_client*|*unauthorized_client*) doc fail "sign-in client" "Google refuses the client id or secret" ;;
+        *) doc warn "sign-in client" "Google gave no answer that can be read" ;;
+    esac
+    if [ -n "${A_CLOUDFLARE_API_TOKEN}" ]; then
+        local zone; zone="$(registered_domain "${A_CREW_HOSTNAME}")"
+        answer="$(printf 'header = "Authorization: Bearer %s"\n' "${A_CLOUDFLARE_API_TOKEN}" \
+            | curl -sS --max-time 10 --config - "https://api.cloudflare.com/client/v4/zones?name=${zone}" 2>/dev/null || true)"
+        if [[ "${answer}" == *'"success":true'* && "${answer}" == *'"id"'* ]]; then doc ok "DNS token" "it reaches the zone ${zone}"
+        else doc fail "DNS token" "it does not reach the zone ${zone}"; fi
+    fi
+}
+
+doctor_print() {
+    local r st check detail fails=0
+    if [ "${JSON}" = 1 ]; then
+        printf '%s\n' "${DOC_RESULTS[@]}" | python3 -I -c '
+import json, sys
+out = []
+for line in sys.stdin.read().splitlines():
+    st, check, detail = line.split("|", 2)
+    out.append({"check": check, "status": st, "detail": detail})
+print(json.dumps({"ok": not any(r["status"] == "fail" for r in out), "checks": out}, indent=2))'
+    else
+        for r in "${DOC_RESULTS[@]}"; do
+            IFS='|' read -r st check detail <<<"${r}"
+            printf '%-5s %-16s %s\n' "${st}" "${check}" "$(printable "${detail}")"
+        done
+    fi
+    for r in "${DOC_RESULTS[@]}"; do [[ "${r}" == fail\|* ]] && fails=$((fails + 1)); done
+    return $(( fails > 0 ))
+}
+
+# An installation that is there already: a repair or an update, and what is wrong with it (21: an
+# install that stopped half way is run again, and goes on from where it stopped).
+doctor_installed() {
+    [ -f "${INSTALL_JSON}" ] || return 0
+    local had done c down=()
+    had="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("data_dir",""))' "${INSTALL_JSON}" 2>/dev/null || true)"
+    if [ -n "${had}" ] && [ -n "${A_CREW_DATA_DIR:-}" ] && [ "${had}" != "${A_CREW_DATA_DIR}" ]; then
+        doc fail "already there" "an installation of Crew with the data folder ${had}"
+        return 0
+    fi
+    doc ok "already there" "an installation of Crew: this is a repair or an update"
+    done="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "${INSTALL_JSON}" 2>/dev/null || true)"
+    if [ -z "${done}" ]; then
+        doc warn install "it stopped before it finished: crew-ctl install goes on from where it stopped"
+        return 0
+    fi
+    have docker || return 0
+    for c in "${CONTAINERS[@]}"; do docker ps --format '{{.Names}}' 2>/dev/null | grep -x "${c}" >/dev/null || down+=("${c}"); done
+    [ ${#down[@]} = 0 ] || doc warn services "${done} is installed, but not running: ${down[*]}"
+}
+
+# The server and the ingress join the sandboxes' and the hosted projects' bridges, so they forward
+# nothing (13.6, since 0.83): Compose starts them so once a release's deploy files that say it are in
+# place, and an update recreates them. A server that forwards starts no sandbox. Doctor alone checks
+# it, so an install that would recreate them is not refused for it.
+doctor_forwarding() {
+    [ -f "${INSTALL_JSON}" ] && have docker || return 0
+    local c got
+    for c in crew-server crew-caddy; do
+        docker ps --format '{{.Names}}' 2>/dev/null | grep -x "${c}" >/dev/null || continue
+        got="$(docker inspect -f '{{index .HostConfig.Sysctls "net.ipv4.ip_forward"}}' "${c}" 2>/dev/null || true)"
+        if [ "${got}" = 0 ]; then doc ok forwarding "${c} is started with net.ipv4.ip_forward=0"
+        else doc fail forwarding "${c} is not started with net.ipv4.ip_forward=0: put the deploy files of a release that sets it in place before its update (crew-ctl install --deploy-files --version X.Y.Z, as root), and the update recreates it"; fi
+    done
+    # The override is the operator's, in the install file (13.6): said while it is set, whatever runs.
+    [ "${A_CREW_ALLOW_IP_FORWARD:-}" = 1 ] && doc warn forwarding "CREW_ALLOW_IP_FORWARD=1: the server starts sandboxes even when its network forwards (crew-ctl edit CREW_ALLOW_IP_FORWARD= takes it out)"
+    return 0
+}
+
+# The tests check the answers alone: the machine's checks read the real machine and the network.
+machine_checks() { doctor_installed; if [ "${CREW_CTL_TEST:-}" = 1 ] && [ "${CREW_CTL_TEST_NO_MACHINE:-}" = 1 ]; then return 0; fi; doctor_machine; }
+
+cmd_doctor() {
+    DOC_RESULTS=()
+    # The answers first, so the installation found is compared with the data folder they give.
+    local answers=0
+    if [ -n "${ENV_IN}" ] || [ -f "${ENV_FILE}" ]; then answers=1; load_answers; fi
+    machine_checks
+    doctor_forwarding
+    if [ "${answers}" = 1 ]; then
+        doctor_answers
+    else
+        A_CREW_TLS=acme
+        doc skip answers "no answers given: the machine alone was checked"
+    fi
+    doctor_print
+}
+
+# ─── Install (16.11) ────────────────────────────────────────────────────────
+resolve_version() { # a tag builds that version; no tag builds 0.0.0-dev.<commit>
+    local repo="$1" tag commit
+    tag="$(git -C "${repo}" describe --tags --exact-match 2>/dev/null || true)"
+    if [[ "${tag}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then echo "${BASH_REMATCH[1]}"; return; fi
+    commit="$(git -C "${repo}" rev-parse --short=12 HEAD 2>/dev/null)" || die "${repo} is not a git checkout"
+    echo "0.0.0-dev.${commit}"
+}
+
+write_env() { # writes the answers to crew.env, root only
+    local tmp k v
+    run install -d -m 0700 -o root -g root "${ETC_DIR}"
+    if [ "${DRY}" = 1 ]; then echo "+ write ${ENV_FILE} (mode 600)"; return; fi
+    tmp="$(mktemp "${ETC_DIR}/.crew.env.XXXXXX")"
+    {
+        echo "# Crew's install file, written by crew-ctl. Change a value with: crew-ctl edit KEY=VALUE"
+        for k in "${KEYS_REQUIRED[@]}" "${KEYS_OPTIONAL[@]}"; do v="A_${k}"; echo "${k}=${!v}"; done
+    } > "${tmp}"
+    chmod 600 "${tmp}"
+    mv -f "${tmp}" "${ENV_FILE}"
+}
+
+make_secrets() { # makes only what is missing: a key file or a password that is there is never replaced
+    local s uid gid
+    uid="$(crew_id -u)"; gid="$(crew_id -g)"
+    run install -d -m 0700 -o root -g root "${SECRETS_DIR}"
+    for s in "${SECRETS[@]}"; do
+        if [ -s "${SECRETS_DIR}/${s}" ]; then continue; fi
+        if [ "${DRY}" = 1 ]; then echo "+ make ${SECRETS_DIR}/${s}"; continue; fi
+        ( umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "${SECRETS_DIR}/${s}" )
+        log "made ${SECRETS_DIR}/${s}"
+    done
+    if [ ! -s "${ETC_DIR}/secret.key" ]; then
+        if [ "${DRY}" = 1 ]; then echo "+ make ${ETC_DIR}/secret.key"
+        else ( umask 077; head -c 32 /dev/urandom > "${ETC_DIR}/secret.key" ); log "made ${ETC_DIR}/secret.key"; fi
+    fi
+    # The containers run as crew, and read them as Docker secrets.
+    run chown "${uid}:${gid}" "${ETC_DIR}/secret.key" "${SECRETS[@]/#/${SECRETS_DIR}/}"
+    run chmod 0400 "${ETC_DIR}/secret.key" "${SECRETS[@]/#/${SECRETS_DIR}/}"
+    write_answer_secrets
+}
+
+write_answer_secrets() { # the answers' secrets as files, so the ingress gets them as Docker secrets
+    local pair file key v uid gid
+    uid="$(crew_id -u)"; gid="$(crew_id -g)"
+    run install -d -m 0700 -o root -g root "${SECRETS_DIR}"
+    for pair in "${ANSWER_SECRETS[@]}"; do
+        file="${SECRETS_DIR}/${pair%%:*}"; key="A_${pair#*:}"; v="${!key}"
+        if [ "${DRY}" = 1 ]; then echo "+ write ${file}"; continue; fi
+        ( umask 077; printf '%s' "${v}" > "${file}.tmp" )
+        chown "${uid}:${gid}" "${file}.tmp" && chmod 0400 "${file}.tmp" && mv -f "${file}.tmp" "${file}"
+    done
+}
+
+# crew_id -u|-g: the system user crew's id. Every container runs as it, so a missing user stops
+# crew-ctl: it never falls back to root. A dry run before the user exists shows a placeholder.
+crew_id() {
+    if id "$1" crew >/dev/null 2>&1; then id "$1" crew; return; fi
+    [ "${DRY}" = 1 ] && { echo "<crew>"; return; }
+    die "the system user crew is missing: crew-ctl install makes it"
+}
+
+# docker_gid: the group of Docker's socket, which the server's container is given (13.8).
+docker_gid() {
+    local g; g="$(stat -c %g /var/run/docker.sock 2>/dev/null)"
+    if [ -n "${g}" ]; then echo "${g}"; return; fi
+    [ "${DRY}" = 1 ] && { echo "<docker>"; return; }
+    die "Docker's socket /var/run/docker.sock is missing"
+}
+
+compose() { # compose ARGS...: the stack, with the install file and versions.lock
+    local uid gid
+    uid="$(crew_id -u)"; gid="$(crew_id -g)"
+    CREW_VERSION="${CREW_VERSION:-$(installed_version)}" CREW_UID="${uid}" CREW_GID="${gid}" \
+    CREW_UPDATER_VERSION="${CREW_UPDATER_VERSION:-$(updater_state updater)}" \
+    CREW_ETC="${ETC_DIR}" CREW_DOCKER_GID="$(docker_gid)" \
+        run docker compose -p crew -f "${LIB_DIR}/compose.yaml" \
+            --env-file "${LIB_DIR}/versions.lock" --env-file "${ENV_FILE}" "$@"
+}
+
+# The version that runs is the updater's to say once it has switched one (16.4); before, install's.
+installed_version() {
+    local v; v="$(updater_state running)"
+    [ -n "${v}" ] && { echo "${v}"; return; }
+    [ -f "${INSTALL_JSON}" ] && python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "${INSTALL_JSON}" 2>/dev/null || true
+}
+
+# data_dir is the data folder install recorded, else the install file's, else the default.
+data_dir() {
+    local d=""
+    [ -f "${INSTALL_JSON}" ] && d="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("data_dir",""))' "${INSTALL_JSON}" 2>/dev/null || true)"
+    [ -n "${d}" ] || { [ -f "${ENV_FILE}" ] && d="$(env_get "${ENV_FILE}" CREW_DATA_DIR)"; }
+    echo "${d:-/var/lib/crew}"
+}
+
+updater_state() { # updater_state KEY: a value of the updater's state.json, '' when there is none
+    local f; f="$(data_dir)/updater/state.json"
+    [ -f "${f}" ] || return 0
+    python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "${f}" "$1" 2>/dev/null || true
+}
+
+# write_updater_state RUNNING: the version install started, with the one before it, for the updater
+# to go on from (16.4). crew-ctl writes it only at install; afterwards it is the updater's.
+write_updater_state() {
+    local f; f="$(data_dir)/updater/state.json"
+    [ "${DRY}" = 1 ] && { echo "+ record in ${f}: running $1"; return; }
+    run install -d -m 0700 -o "$(crew_id -u)" -g "$(crew_id -g)" "$(dirname "${f}")"
+    python3 -I - "${f}" "$1" <<'PY'
+import json, os, sys, tempfile
+path, running = sys.argv[1], sys.argv[2]
+d = json.load(open(path)) if os.path.exists(path) else {}
+if d.get("running") and d.get("running") != running:
+    d["previous"] = d["running"]
+d["running"] = running
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=2, sort_keys=True)
+os.chmod(tmp, 0o640)
+os.replace(tmp, path)
+PY
+}
+
+record_json() { # record_json KEY VALUE...: merges facts into install.json
+    [ "${DRY}" = 1 ] && { echo "+ record in ${INSTALL_JSON}: $*"; return; }
+    python3 -I - "${INSTALL_JSON}" "$@" <<'PY'
+import json, os, sys, tempfile
+path, args = sys.argv[1], sys.argv[2:]
+d = json.load(open(path)) if os.path.exists(path) else {}
+for k, v in zip(args[0::2], args[1::2]):
+    d[k] = json.loads(v) if v[:1] in ("[", "{") else v
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=2, sort_keys=True)
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+PY
+}
+
+merge_host_record() { # turns host-setup's record into install.json, never changing "installed" to "found"
+    local rec="$1"
+    [ "${DRY}" = 1 ] && return
+    python3 -I - "${INSTALL_JSON}" "${rec}" <<'PY'
+import json, os, sys, tempfile
+path, rec = sys.argv[1], sys.argv[2]
+d = json.load(open(path)) if os.path.exists(path) else {}
+parts = d.setdefault("machine", {})
+lists = {"package", "unit", "file", "kernel_setting", "kata_dir"}
+for line in open(rec):
+    key, _, value = line.rstrip("\n").partition(" ")
+    if key in lists:
+        parts.setdefault(key + "s", [])
+        if value not in parts[key + "s"]:
+            parts[key + "s"].append(value)
+        if key == "kata_dir" and value in parts.get("kata_dirs_gone", []):
+            parts["kata_dirs_gone"].remove(value)
+    elif key == "kata_dir_gone":
+        # A folder of Kata the host setup removed is no longer Crew's to remove (13.2), also 3.31's, which
+        # "installed 3.x" would otherwise name for good (security review of 0001b6a).
+        parts["kata_dirs"] = [d for d in parts.get("kata_dirs", []) if d != value]
+        gone = parts.setdefault("kata_dirs_gone", [])
+        if value not in gone:
+            gone.append(value)
+    elif key == "daemon_json":
+        prev = parts.setdefault("daemon_json", {})
+        for k, v in json.loads(value).items():
+            prev.setdefault(k, v)   # the value before Crew's first change is the one to put back
+    elif key in ("docker", "kata", "user"):
+        old = parts.get(key, "")
+        if old.startswith(("installed", "created")) and value.startswith(("found",)):
+            continue
+        parts[key] = value
+    else:
+        parts[key] = value
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=2, sort_keys=True)
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+PY
+}
+
+copy_deploy_files() { # what crew-ctl needs after install, without the checkout
+    run install -d -m 0755 "${LIB_DIR}" "${LIB_DIR}/db" "${LIB_DIR}/lib" "${LIB_DIR}/firewall"
+    run install -m 0644 "${REPO}/deploy/compose.yaml" "${REPO}/versions.lock" "${LIB_DIR}/"
+    run install -m 0755 "${REPO}/deploy/db/10-roles.sh" "${LIB_DIR}/db/"
+    run install -m 0755 "${REPO}/deploy/host-setup.sh" "${REPO}/deploy/proof.sh" "${REPO}/deploy/release.sh" "${LIB_DIR}/"
+    run install -m 0644 "${REPO}/deploy/lib/"* "${LIB_DIR}/lib/"
+    run install -m 0644 "${REPO}/deploy/firewall/"* "${LIB_DIR}/firewall/"
+    run install -m 0755 "${REPO}/deploy/crew-ctl" "${SBIN_DIR}/crew-ctl"
+}
+
+# ─── The deploy files (16.11, since 0.55) ──────────────────────────────────
+# An update replaces the containers, not crew-ctl and its files, which are root's. Install records the
+# hash of each file it put in place, by its path in the repository, in install.json and, for Versions,
+# in the releases folder, which the server reads. Every run of crew-ctl compares the files in place with
+# the running release's deploy archive, and says the one command that puts the release's own in place.
+DEPLOY_RECORD=deploy-files.json
+
+# deploy_hashes ROOT: the deploy files of a tree, as the deploy archive holds them (release.DeployFiles),
+# each with the hash of the file install puts in place for it, "-" when there is none: "PATH SHA256".
+deploy_hashes() {
+    python3 -I - "$1" "${LIB_DIR}" "${SBIN_DIR}" <<'PY'
+import hashlib, os, sys
+root, lib, sbin = sys.argv[1:4]
+paths = ["deploy/crew-ctl", "deploy/release.sh", "deploy/host-setup.sh", "deploy/proof.sh", "deploy/compose.yaml", "versions.lock"]
+for d in ("deploy/db", "deploy/lib", "deploy/firewall"):
+    for dirpath, _, files in os.walk(os.path.join(root, d)):
+        paths += [os.path.relpath(os.path.join(dirpath, f), root) for f in files]
+def target(p):
+    if p == "deploy/crew-ctl":
+        return os.path.join(sbin, "crew-ctl")
+    if p == "versions.lock":
+        return os.path.join(lib, "versions.lock")
+    return os.path.join(lib, p[len("deploy/"):])
+for p in sorted(paths):
+    try:
+        with open(target(p), "rb") as f:
+            print(p, hashlib.sha256(f.read()).hexdigest())
+    except OSError:
+        print(p, "-")
+PY
+}
+
+# record_deploy_files: after the deploy files of REPO were put in place, the hash of each goes into
+# install.json and into the releases folder, where Versions reads it.
+record_deploy_files() {
+    local dir; dir="$(data_dir)/releases"
+    [ "${DRY}" = 1 ] && { echo "+ record the hashes of the deploy files in ${INSTALL_JSON} and ${dir}/${DEPLOY_RECORD}"; return 0; }
+    local files
+    # Each step returns on its failure: install calls this under ||, where errexit does not hold.
+    files="$(deploy_hashes "${REPO}" | python3 -I -c 'import json, sys; print(json.dumps(dict(l.split(" ", 1) for l in sys.stdin.read().splitlines() if l), sort_keys=True))')" || return 1
+    [ -n "${files}" ] || return 1
+    record_json deploy_files "${files}" || return 1
+    install -d -m 0755 "${dir}" || return 1
+    printf '%s' "${files}" | python3 -I -c '
+import json, os, sys, tempfile
+path = sys.argv[1]
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+os.fchmod(fd, 0o644)
+with os.fdopen(fd, "w") as f:
+    json.dump({"files": json.load(sys.stdin)}, f, indent=2, sort_keys=True)
+os.replace(tmp, path)' "${dir}/${DEPLOY_RECORD}"
+}
+
+# deploy_py MODE ARGS...: the one reader of a release's deploy archive, as root, with python3 -I
+# (nothing of the caller's folder is imported). It reads an archive of at most 64 MiB once, decompresses
+# at most 256 MiB of it, and takes only the deploy files' own names (the fixed list, and one name of
+# letters, digits, dots, dashes and underscores under deploy/db, deploy/lib, deploy/firewall), regular
+# files of at most 16 MiB each; it never follows a link in place.
+#   compare ARCHIVE LIB SBIN: the paths whose file in place differs, one a line
+#   unpack ARCHIVE DIR: writes those files under DIR
+#   verify FOLDER RUNNING: the archive against release.json, release.json against a gate that passed,
+#     of its version, whose live part is not pending or failed; with no gate, a build by hand, and only
+#     the running release. It prints how it checked, or fails with why.
+#   take FOLDER RUNNING DIR: verify, then unpack the very bytes it checked
+deploy_py() {
+    python3 -I - "$@" <<'PY'
+import gzip, hashlib, io, json, os, posixpath, re, stat, sys, tarfile
+MAX, ARCHIVE_MAX, UNPACKED_MAX = 16 << 20, 64 << 20, 256 << 20
+FIXED = {"deploy/crew-ctl", "deploy/release.sh", "deploy/host-setup.sh", "deploy/proof.sh", "deploy/compose.yaml", "versions.lock"}
+NAME = re.compile(r"[A-Za-z0-9._-]+")
+def allowed(name):
+    if name in FIXED:
+        return True
+    parts = name.split("/")
+    return (len(parts) == 3 and parts[0] == "deploy" and parts[1] in ("db", "lib", "firewall")
+            and NAME.fullmatch(parts[2]) is not None and parts[2] not in (".", ".."))
+class Capped(io.RawIOBase):
+    def __init__(self, f):
+        self.f, self.n = f, 0
+    def readable(self):
+        return True
+    def readinto(self, b):
+        n = self.f.readinto(b)
+        self.n += n
+        if self.n > UNPACKED_MAX:
+            raise ValueError("the deploy archive unpacks to more than 256 MiB")
+        return n
+def load(archive):
+    with open(archive, "rb") as f:
+        data = f.read(ARCHIVE_MAX + 1)
+    if len(data) > ARCHIVE_MAX:
+        raise ValueError("the deploy archive is larger than 64 MiB")
+    return data
+def members(data):
+    raw = io.BufferedReader(Capped(gzip.GzipFile(fileobj=io.BytesIO(data))))
+    with tarfile.open(fileobj=raw, mode="r|") as t:
+        for m in t:
+            if m.isreg() and allowed(m.name) and m.size <= MAX:
+                yield m.name, t.extractfile(m).read(MAX + 1)
+def target(p, lib, sbin):
+    if p == "deploy/crew-ctl":
+        return os.path.join(sbin, "crew-ctl")
+    if p == "versions.lock":
+        return os.path.join(lib, "versions.lock")
+    return os.path.join(lib, p[len("deploy/"):])
+def in_place(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX:
+            return None
+        h = hashlib.sha256()
+        while chunk := os.read(fd, 1 << 16):
+            h.update(chunk)
+        return h.hexdigest()
+    finally:
+        os.close(fd)
+def unpack(data, out):
+    for name, body in members(data):
+        dst = os.path.join(out, name)
+        os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
+        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+def verify(folder, running):
+    with open(os.path.join(folder, "release.json"), "rb") as f:
+        body = f.read(1 << 20)
+    m = json.loads(body)
+    v = m.get("version")
+    if v != os.path.basename(os.path.normpath(folder)):
+        sys.exit("release.json is of another version than its folder")
+    d = m.get("deploy") or {}
+    if d.get("file") != "deploy.tar.gz" or not d.get("sha256"):
+        sys.exit("release.json names no deploy archive")
+    data = load(os.path.join(folder, "deploy.tar.gz"))
+    if hashlib.sha256(data).hexdigest() != d["sha256"]:
+        sys.exit("the deploy archive is not the one release.json names")
+    try:
+        with open(os.path.join(folder, "gate.json"), "rb") as f:
+            g = json.loads(f.read(1 << 20))
+    except FileNotFoundError:
+        if m.get("byHand") is True and v == running:
+            return "no gate: a release by hand, the running one", data
+        sys.exit("no gate passed it, and it is not the running release by hand")
+    if g.get("manifestSha256") != hashlib.sha256(body).hexdigest():
+        sys.exit("gate.json was written for another release.json")
+    if g.get("version") != v or g.get("passed") is not True or g.get("live", "") not in ("", "passed", "skipped"):
+        sys.exit("its gate did not pass")
+    return "gated", data
+mode, args = sys.argv[1], sys.argv[2:]
+try:
+    if mode == "compare":
+        archive, lib, sbin = args
+        for name, body in members(load(archive)):
+            if in_place(target(name, lib, sbin)) != hashlib.sha256(body).hexdigest():
+                print(name)
+    elif mode == "unpack":
+        archive, out = args
+        unpack(load(archive), out)
+    elif mode == "verify":
+        print(verify(*args)[0])
+    elif mode == "take":
+        folder, running, out = args
+        how, data = verify(folder, running)
+        unpack(data, out)
+        print(how)
+except (OSError, ValueError, tarfile.TarError, EOFError) as e:
+    sys.exit(str(e))
+PY
+}
+
+# deploy_files_behind: one line on stderr when the deploy files in place are not those of the running
+# release's deploy archive, with the command for root, this crew-ctl's install --deploy-files; a
+# warning instead when the archive does not check. Nothing when they are the same, or when there is
+# nothing to compare with. It changes nothing, and never fails the run.
+deploy_files_behind() {
+    [ -f "${INSTALL_JSON}" ] || return 0
+    local v folder differ how self
+    v="$(installed_version)"
+    valid_version "${v}" || return 0
+    folder="$(data_dir)/releases/${v}"
+    [ -f "${folder}/deploy.tar.gz" ] || return 0
+    if ! differ="$(deploy_py compare "${folder}/deploy.tar.gz" "${LIB_DIR}" "${SBIN_DIR}" 2>&1)"; then
+        warn "the deploy archive of ${v} cannot be read: $(printable "${differ}" | tail -c 300)"
+        return 0
+    fi
+    [ -n "${differ}" ] || return 0
+    if ! how="$(deploy_py verify "${folder}" "${v}" 2>&1)"; then
+        warn "crew-ctl and its files are not those of the running release ${v}, and its release folder does not check ($(printable "${how}" | tail -c 200)): Crew offers no command"
+        return 0
+    fi
+    self="$(readlink -f "${BASH_SOURCE[0]}")"
+    echo "==> crew-ctl and its files are not those of the running release ${v} ($(grep -c . <<<"${differ}") differ, $(printable "$(head -1 <<<"${differ}")") first). As root: $(printf '%q' "${self}") install --deploy-files" >&2
+}
+
+# install_deploy_files: install --deploy-files. The running release's deploy files, or those of
+# --version, checked against its release.json and gate.json, unpacked by their names alone into a
+# folder of mktemp, put in place by this crew-ctl, and recorded, with the running release's version in
+# install.json; nothing else is changed. A release whose archive or gate does not check is refused with
+# nothing changed.
+install_deploy_files() {
+    { [ "${BUILD}" = 0 ] && [ "${UPGRADE}" = 0 ] && [ -z "${FROM_DIR}" ]; } || die "install --deploy-files takes no --build, --upgrade-runtime or --from"
+    [ -f "${INSTALL_JSON}" ] || die "Crew is not installed: install --deploy-files puts in place the files of an installed Crew"
+    local v folder how
+    v="${VERSION_ARG:-$(installed_version)}"
+    valid_version "${v}" || die "no release to take the deploy files of: give --version X.Y.Z"
+    folder="$(data_dir)/releases/${v}"
+    REPO="$(mktemp -d)"
+    if ! how="$(deploy_py take "${folder}" "$(installed_version)" "${REPO}" 2>&1)"; then
+        rm -rf "${REPO}"
+        die "the release folder of ${v} does not check ($(printable "${how}" | tail -c 200)); nothing was changed"
+    fi
+    # Every file the copy names, before the first is put in place.
+    local f missing=""
+    for f in deploy/crew-ctl deploy/release.sh deploy/host-setup.sh deploy/proof.sh deploy/compose.yaml deploy/db/10-roles.sh versions.lock; do
+        [ -f "${REPO}/${f}" ] || missing="${f}"
+    done
+    compgen -G "${REPO}/deploy/lib/*" >/dev/null || missing=deploy/lib
+    compgen -G "${REPO}/deploy/firewall/*" >/dev/null || missing=deploy/firewall
+    if [ -n "${missing}" ]; then
+        rm -rf "${REPO}"
+        die "the deploy archive of ${v} holds no ${missing}; nothing was changed"
+    fi
+    copy_deploy_files
+    record_deploy_files
+    # Install's record names the release it put in, and an update leaves it so: the running release's
+    # files make it name that one. An install that stopped half way stays unmarked, for doctor to say.
+    local had
+    had="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "${INSTALL_JSON}" 2>/dev/null || true)"
+    if [ -n "${had}" ] && [ "${had}" != "${v}" ] && [ "${v}" = "$(updater_state running)" ]; then
+        record_json version "${v}"
+    fi
+    rm -rf "${REPO}"
+    log "crew-ctl and its files are those of ${v} (${how}); nothing else was changed"
+}
+
+build_one() { # build_one TAG DOCKERFILE CONTEXT [TARGET [ARGS...]]: the whole output goes to a log, its end on failure; TARGET "" is none
+    local tag="$1" file="$2" ctx="$3" target=() out
+    [ -z "${4:-}" ] || target=(--target "$4")
+    shift 3; shift || true
+    [ "${DRY}" = 1 ] && { echo "+ docker build -f ${file} ${target[*]} $* -t ${tag} ${ctx}"; return; }
+    out="$(mktemp)"
+    if docker build --progress=plain -f "${file}" "${target[@]}" "$@" --build-arg "CREW_VERSION=${tag##*:}" -t "${tag}" "${ctx}" > "${out}" 2>&1; then
+        log "built ${tag}"; rm -f "${out}"
+    else
+        tail -60 "${out}" >&2; rm -f "${out}"
+        die "the build of ${tag} failed (its last lines are above)"
+    fi
+}
+
+build_images() {
+    local v="$1" agy
+    log "building the images of ${v} from ${REPO}"
+    build_one "crew-server:${v}" "${REPO}/deploy/Dockerfile.server" "${REPO}"
+    build_one "crew-caddy:${v}" "${REPO}/ingress/Dockerfile" "${REPO}/ingress"
+    agy="$(agy_folder)"
+    # A dry run's folder is only a name: nothing is removed by it.
+    fetch_agy "${REPO}/versions.lock" "${agy}" || { [ "${DRY}" = 1 ] || rm -rf -- "${agy}"; exit 1; }
+    ( build_one "crew-runtime:${v}" "${REPO}/image/Dockerfile" "${REPO}" "" --build-context "agy=${agy}" ) || { [ "${DRY}" = 1 ] || rm -rf -- "${agy}"; exit 1; }
+    [ "${DRY}" = 1 ] || rm -rf -- "${agy}"
+    build_one "crew-updater:${v}" "${REPO}/deploy/Dockerfile.server" "${REPO}" updater
+}
+
+# AGY_TARBALL is the whole shape of agy's tarball's address, with its version as the first group: the
+# vendor's bucket and no other, as the adapter (internal/cli/agy.go) and tools/check-versions.py hold
+# it. AGY_MAX bounds the download (62 MiB at 1.4.5).
+AGY_TARBALL='^https://storage\.googleapis\.com/antigravity-public/antigravity-cli/([0-9]+\.[0-9]+\.[0-9]+)-[0-9]+/linux-x64/cli_linux_x64\.tar\.gz$'
+AGY_MAX=536870912
+
+# agy_folder: a new folder for agy's tarball; in a dry run only its name.
+agy_folder() { if [ "${DRY}" = 1 ]; then echo "<a folder of mktemp>"; else mktemp -d; fi; }
+
+# fetch_agy LOCK DIR: agy's tarball as the versions.lock LOCK pins it, into DIR/cli_linux_x64.tar.gz,
+# which the runtime image copies from its build context agy (12.8, since 0.57). The address must be the
+# vendor's with AGY_VERSION in it, in a dry run too; the download is https only and follows no
+# redirect, sends nothing that names this machine, is cut past AGY_MAX bytes also when the answer gives
+# no length, and is kept only with the pin's sha512. A refusal leaves no file and names no value of
+# the lock, which a commit wrote.
+fetch_agy() {
+    local lock="$1" dir="$2" v url sum file status
+    v="$(sed -n 's/^AGY_VERSION=//p' "${lock}" | tail -1)"
+    url="$(sed -n 's/^AGY_URL=//p' "${lock}" | tail -1)"
+    sum="$(sed -n 's/^AGY_SHA512=//p' "${lock}" | tail -1)"
+    if ! [[ "${url}" =~ ${AGY_TARBALL} ]] || [ "${BASH_REMATCH[1]}" != "${v}" ]; then
+        echo "crew-ctl: ERROR versions.lock: AGY_URL is not the address of the vendor's tarball at AGY_VERSION" >&2; return 1
+    fi
+    [[ "${sum}" =~ ^[0-9a-f]{128}$ ]] || { echo "crew-ctl: ERROR versions.lock: AGY_SHA512 is not a sha512 checksum" >&2; return 1; }
+    file="${dir}/cli_linux_x64.tar.gz"
+    if [ "${DRY}" = 1 ]; then
+        echo "+ curl --proto =https --max-redirs 0 ${url} into ${file}, at most ${AGY_MAX} bytes, checked by its sha512"
+        return 0
+    fi
+    install -d -m 0755 "${dir}" || return 1
+    log "downloading agy ${v}"
+    # -q first: root's ~/.curlrc adds nothing, a header naming the machine neither.
+    if ! curl -q -sS --proto '=https' --max-redirs 0 --max-time 600 -D "${dir}/headers" "${url}" | head -c "$((AGY_MAX + 1))" > "${file}"; then
+        rm -f -- "${file}" "${dir}/headers"
+        echo "crew-ctl: ERROR agy's tarball: the download failed, or was more than ${AGY_MAX} bytes" >&2; return 1
+    fi
+    # The vendor's answer is the last status line: behind a proxy, the CONNECT's 200 comes first.
+    status="$(tr -d '\r' < "${dir}/headers" | grep '^HTTP/' | tail -1)"; rm -f -- "${dir}/headers"
+    if ! [[ "${status}" =~ ^HTTP/[0-9.]+\ 200( |$) ]]; then
+        rm -f -- "${file}"
+        echo "crew-ctl: ERROR agy's tarball: the vendor's address answered $(printable "${status#* }" | head -c 40), not 200" >&2; return 1
+    fi
+    if [ "$(stat -c %s "${file}")" -gt "${AGY_MAX}" ]; then
+        rm -f -- "${file}"
+        echo "crew-ctl: ERROR agy's tarball: the answer is more than ${AGY_MAX} bytes" >&2; return 1
+    fi
+    if ! echo "${sum}  ${file}" | sha512sum -c --status -; then
+        rm -f -- "${file}"
+        echo "crew-ctl: ERROR agy's tarball is not the one versions.lock pins: its sha512 differs" >&2; return 1
+    fi
+}
+
+wait_healthy() { # wait_healthy CONTAINER SECONDS
+    [ "${DRY}" = 1 ] && return 0
+    local st
+    for _ in $(seq 1 "$2"); do
+        st="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$1" 2>/dev/null || true)"
+        [ "${st}" = healthy ] && return 0
+        sleep 1
+    done
+    die "$1 is not healthy after $2 seconds (crew-ctl logs)"
+}
+
+ADMIN_ENV=()
+admin() { # admin ARGS...: crew admin, in a container of the server's image that lives for one command
+    compose run --rm -T "${ADMIN_ENV[@]}" crew-admin admin "$@"
+}
+
+# database_sql NAME: the statements of the roles script that make the database crew, for a database of
+# another name, with its privileges: the roles are there already.
+database_sql() {
+    sed -n "/<<'SQL'\$/,/^SQL\$/p" "${DEPLOY}/db/10-roles.sh" | sed '1d;$d' \
+        | grep -v -e '^\\set ' -e '^CREATE ROLE' \
+        | sed -e "s/DATABASE crew /DATABASE $1 /g" -e "s/^\\\\connect crew\$/\\\\connect $1/"
+}
+
+# selftest (16.11): one ticket on a project of its own with the fake harness, in a database of its own
+# made for it, so the running server's pipeline neither sees it nor works it; the database is removed
+# after it.
+cmd_selftest() {
+    need_root
+    [ -f "${ENV_FILE}" ] || die "Crew is not installed"
+    local sql rc=0
+    sql="DROP DATABASE IF EXISTS crew_selftest WITH (FORCE);"$'\n'"$(database_sql crew_selftest)"
+    if [ "${DRY}" = 1 ]; then printf '+ in crew-db as postgres:\n%s\n' "${sql}"
+    else printf '%s\n' "${sql}" | docker exec -i crew-db psql -X -q -U postgres -d postgres -v ON_ERROR_STOP=1 -f - >/dev/null \
+        || die "the selftest's database was not made"; fi
+    ADMIN_ENV=(-e CREW_DB_NAME=crew_selftest)
+    admin migrate && admin selftest || rc=$?
+    ADMIN_ENV=()
+    run docker exec crew-db psql -X -q -U postgres -d postgres -c "DROP DATABASE IF EXISTS crew_selftest WITH (FORCE)" >/dev/null \
+        || warn "the selftest's database crew_selftest was not removed"
+    return "${rc}"
+}
+
+cmd_install() {
+    need_root
+    ctl_lock
+    # The deploy files alone (16.11, since 0.55): a release's, checked, and nothing else.
+    if [ "${DEPLOY_FILES}" = 1 ]; then install_deploy_files; return 0; fi
+    # A newer machine setup (16.4): the host setup runs again, from this checkout, and records its
+    # number. Docker of another major version is not replaced by it; an older Kata is (13.2, since 0.68).
+    if [ "${UPGRADE}" = 1 ]; then
+        [ -z "${FROM_DIR}" ] || die "--upgrade-runtime installs from this checkout, not --from a folder"
+        BUILD=1
+    fi
+    # Another machine's first install (16.12): a card, with its images pulled. The token file is read
+    # once here, before anything is changed, and used once, after the host setup installed Docker.
+    if [ -n "${REG_TOKEN_FILE}" ]; then
+        [ -n "${FROM_DIR}" ] || die "--registry-token-file pulls the images of a card: install --from CARD"
+        # One that stopped at any step, its proof included, is run again as a repair: it records no
+        # version, or the card's. Another version installed here takes the updater's path.
+        if [ -f "${INSTALL_JSON}" ]; then
+            local had; had="$(installed_version)"
+            [ -z "${had}" ] || [ "${had}" = "$(release_version "${FROM_DIR}")" ] \
+                || die "Crew ${had} is installed here: release pull brings a later release"
+        fi
+        read_token "${REG_TOKEN_FILE}"
+    fi
+    [ "${BUILD}" = 1 ] || [ -n "${FROM_DIR}" ] || die "install needs --build, which builds the images from this checkout, or --from a release folder"
+    [ "${BUILD}" = 0 ] || [ -z "${FROM_DIR}" ] || die "install takes --build or --from, not both"
+    # On a running Crew a folder is a build by hand, which the updater installs (16.10); a card's first
+    # install run again is a repair, which takes the whole path.
+    if [ -n "${FROM_DIR}" ] && [ -z "${REG_TOKEN_FILE}" ] && [ -f "${INSTALL_JSON}" ] && [ -f "${LIB_DIR}/compose.yaml" ]; then
+        install_by_hand; return
+    fi
+    REPO="$(cd "${SELF_DIR}/.." && pwd)"
+    [ -f "${REPO}/deploy/compose.yaml" ] || die "run install from a checkout: deploy/crew-ctl install --build"
+    local v rec
+    # 1. The answers, before anything is changed.
+    load_answers
+    # 2. Doctor, on the machine and the answers.
+    DOC_RESULTS=(); machine_checks; doctor_answers
+    doctor_print || die "the doctor found the problems above; nothing was changed"
+    if [ -n "${FROM_DIR}" ]; then v="$(release_version "${FROM_DIR}")"; else v="$(resolve_version "${REPO}")"; fi
+    log "installing Crew ${v}"
+    local had_install=0; [ -f "${INSTALL_JSON}" ] && had_install=1
+    # 3. The install file.
+    write_env
+    record_json data_dir "${A_CREW_DATA_DIR}"
+    # An update from a newer checkout takes a dump first; until the updater exists there is no other
+    # way back (16.11).
+    if [ "${had_install}" = 1 ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -x crew-server >/dev/null; then
+        log "a dump before the update"
+        admin backup || die "the dump before the update failed; nothing else was changed"
+    fi
+    # 4 to 7. Docker, Kata, Docker's settings, the firewall, the user crew, and the data folders.
+    rec="$(mktemp)"
+    if [ "${DRY}" = 1 ]; then
+        echo "+ host-setup.sh --record ${rec} (DOCKER_VERSION=$(lock_value DOCKER_VERSION) KATA_VERSION=$(lock_value KATA_VERSION))"
+    else
+        CREW_DATA_DIR="${A_CREW_DATA_DIR}" DOCKER_VERSION="$(lock_value DOCKER_VERSION)" \
+        KATA_VERSION="$(lock_value KATA_VERSION)" KATA_SHA256="$(lock_value KATA_SHA256)" \
+        KATA_OURS="$(kata_ours)" \
+        PROOF_IMAGE="$(lock_value RUNTIME_BASE_IMAGE)" \
+            bash "${REPO}/deploy/host-setup.sh" --record "${rec}"
+        merge_host_record "${rec}"
+    fi
+    rm -f "${rec}"
+    record_json machine_setup "$(lock_value MACHINE_SETUP)"
+    make_secrets
+    # 8. The images, built from the checkout on this machine, or loaded from a release folder. A
+    # checkout with nothing uncommitted is built as its release folder, the first one (16.11).
+    if [ -n "${FROM_DIR}" ] && [ -n "${REG_TOKEN_FILE}" ]; then registry_login; pull_images "${FROM_DIR}"; registry_logout
+    elif [ -n "${FROM_DIR}" ]; then load_release "${FROM_DIR}"
+    elif [ -z "$(git_repo status --porcelain 2>/dev/null)" ] && [ ! -e "$(data_dir)/releases/${v}" ]; then write_release "${v}"
+    else build_images "${v}"; fi
+    # The deploy files only once the images are there: a build that fails leaves the machine's deploy
+    # files those of the release that runs, which its updater reads (the install of 0.2.12 on dave).
+    copy_deploy_files
+    # The restart timer runs the crew-ctl just put in place (16.10): it starts only now.
+    if [ -f "${UNIT_DIR}/crew-restart.timer" ] || [ "${DRY}" = 1 ]; then
+        run systemctl start crew-restart.timer || warn "crew-restart.timer did not start: systemctl status crew-restart.timer"
+    fi
+    # The record is for the comparison only: a failure leaves the install to go on.
+    record_deploy_files || warn "the hashes of the deploy files were not recorded: crew-ctl and Versions say they differ"
+    # 9. The database, the schema, then the server and the ingress.
+    export CREW_VERSION="${v}"
+    compose up -d crew-db
+    wait_healthy crew-db 120
+    admin migrate
+    compose up -d --remove-orphans crew-server crew-caddy
+    wait_healthy crew-server 60
+    # The first release folder, so the updater has a version to go back to (16.11), and the updater.
+    if [ -n "${FROM_DIR}" ]; then keep_release "${FROM_DIR}"; [ "${DRY}" = 1 ] || [ -z "${PULLED_FILE}" ] || rm -f -- "${PULLED_FILE}"
+    elif [ -n "$(git_repo status --porcelain 2>/dev/null)" ]; then
+        warn "no release folder for ${v}: the checkout has changes that are not committed"; fi
+    write_updater_state "${v}"
+    CREW_UPDATER_VERSION="${v}" compose up -d --no-deps crew-updater
+    record_json version "${v}"
+    record_json installed_at "$(date -u +%FT%TZ)"
+    # 10. Proof.
+    cmd_proof
+    # 11. The address.
+    log "Crew ${v} runs at https://${A_CREW_HOSTNAME}"
+    [ "${A_CREW_TLS}" = internal ] || log "the Google sign-in client lists the redirect address $(redirect_address)$(apps_redirect)"
+}
+
+# ─── Releases (16.1, 16.2, 16.4, 16.10, 16.11; M14) ─────────────────────────
+git_repo() { git -c safe.directory="${REPO}" -C "${REPO}" "$@"; }
+
+valid_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-dev\.[0-9a-f]{7,40})?$ ]]; }
+
+release_version() { # release_version FOLDER: the version its release.json names, which is its name
+    local f="$1/release.json" v
+    [ -f "${f}" ] || die "$1 is not a release folder: it has no release.json"
+    v="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "${f}" 2>/dev/null || true)"
+    valid_version "${v}" || die "$1: release.json names no version"
+    [ "$(basename "$1")" = "${v}" ] || die "$1 holds the release ${v}: its folder must be named so"
+    echo "${v}"
+}
+
+# check_release FOLDER: every image file has the hash release.json names (16.4, step 2).
+check_release() {
+    [ "${DRY}" = 1 ] && { echo "+ check the hashes of $1/images"; return; }
+    python3 -I - "$1" <<'PY' || die "$1: an image does not have the hash its release.json names; nothing was changed"
+import hashlib, json, os, re, sys
+d = sys.argv[1]
+m = json.load(open(os.path.join(d, "release.json")))
+# An image a release pull took from a registry has no file: pulled.json names the config digest the
+# pull checked, which must be release.json's id (16.12, D48).
+pulled = {}
+if os.path.exists(os.path.join(d, "pulled.json")):
+    pf = json.load(open(os.path.join(d, "pulled.json")))
+    if pf.get("version") != m["version"]:
+        print("pulled.json names another version", file=sys.stderr)
+        sys.exit(1)
+    pulled = pf.get("images", {})
+for name, img in m["images"].items():
+    if name in pulled:
+        pl = pulled[name]
+        if pl.get("config") != img["id"] or not re.fullmatch(r"sha256:[0-9a-f]{64}", pl.get("manifest", "")):
+            print(f"{name}: pulled as {pl.get('config', '')[:19]}, not {img['id'][:19]}", file=sys.stderr)
+            sys.exit(1)
+        continue
+    p = os.path.normpath(os.path.join(d, img["file"]))
+    if not p.startswith(os.path.normpath(d) + os.sep):
+        sys.exit(1)
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    if h.hexdigest() != img["sha256"]:
+        print(f"{name}: {h.hexdigest()[:12]}, not {img['sha256'][:12]}", file=sys.stderr)
+        sys.exit(1)
+PY
+}
+
+# image_ids FILE ID TAG: the ids Docker may give the image of a file docker save wrote, one a line: its
+# config digest, which release.json names as ID, and each manifest of the file's index.json that names
+# that config, which is the id the containerd image store gives (D48). It fails when the file holds
+# another image, or names another tag than TAG, which its load would give too, as the updater's Load
+# refuses one (RepoTags). A file that is no tar is left to docker load, which refuses it.
+image_ids() {
+    python3 -I - "$1" "$2" "$3" <<'PY'
+import hashlib, json, posixpath, re, sys, tarfile
+path, want, own = sys.argv[1], sys.argv[2], sys.argv[3]
+def short(n):
+    for p in ("docker.io/library/", "docker.io/"):
+        if n.startswith(p):
+            return n[len(p):]
+    return n
+try:
+    tf = tarfile.open(path, "r:")
+except (tarfile.TarError, OSError):
+    print(want)
+    sys.exit(0)
+configs, index, blobs, kept, tags, seen = [], [], {}, 0, [], set()
+with tf:
+    for ti in tf:
+        name = posixpath.normpath(ti.name.lstrip("/"))
+        if name in ("manifest.json", "index.json", "repositories"):
+            if name in seen or not ti.isfile() or ti.size > 1 << 20:
+                sys.exit(f"{path} holds {name} twice, or as no small file")
+            seen.add(name)
+            doc = json.load(tf.extractfile(ti))
+            if name == "manifest.json":
+                configs += [e["Config"] for e in doc if e.get("Config")]
+                tags += [t for e in doc for t in e.get("RepoTags") or []]
+            elif name == "index.json":
+                index = doc.get("manifests", [])
+                for d in index:
+                    a = d.get("annotations") or {}
+                    if a.get("io.containerd.image.name"):
+                        tags.append(short(a["io.containerd.image.name"]))
+                    elif ":" in a.get("org.opencontainers.image.ref.name", ""):
+                        tags.append(short(a["org.opencontainers.image.ref.name"]))
+            else:
+                tags += [short(r) + ":" + t for r, by in doc.items() for t in by]
+        elif name.startswith("blobs/sha256/") and ti.isfile() and ti.size <= 1 << 20 and kept + ti.size <= 64 << 20:
+            blobs["sha256:" + name[len("blobs/sha256/"):]] = tf.extractfile(ti).read()
+            kept += ti.size
+other = sorted({t for t in tags if t != own})
+if other:
+    sys.exit(f"{path} also names {other[0]}: a release's file names only its own tag")
+if not configs:
+    print(want)
+    sys.exit(0)
+if len(configs) != 1:
+    sys.exit(f"{path} holds {len(configs)} images: a release's file holds one")
+c = configs[0]
+# manifest.json names the config as a path: blobs/sha256/HEX since Docker 25, HEX.json before.
+if c.startswith("blobs/sha256/"):
+    c = "sha256:" + c[len("blobs/sha256/"):]
+elif c.endswith(".json") and "/" not in c:
+    c = "sha256:" + c[:-len(".json")]
+if not re.fullmatch(r"sha256:[0-9a-f]{64}", c) or c != want:
+    sys.exit(f"{path} holds the image {c[:19]}, and release.json names {want[:19]}")
+def platform(d):
+    # "amd64" for exactly linux/amd64; "like" for another entry Docker could take for it once it
+    # normalised it (case, x86_64, a variant, an empty field, no platform); "other" for another platform.
+    p = d.get("platform") or {}
+    if p == {"os": "linux", "architecture": "amd64"}:
+        return "amd64"
+    os_, arch = str(p.get("os", "")).lower(), str(p.get("architecture", "")).lower()
+    return "like" if os_ in ("linux", "") and arch in ("amd64", "x86_64", "x86-64", "") else "other"
+def names(d, depth):
+    b = blobs.get(d.get("digest", ""))
+    if b is None or "sha256:" + hashlib.sha256(b).hexdigest() != d["digest"]:
+        return False
+    try:
+        m = json.loads(b)
+    except ValueError:
+        return False
+    if m.get("config", {}).get("digest") == c:
+        return True
+    # An index holds one manifest for exactly linux/amd64, the one Docker runs, which must name c, and
+    # no other entry Docker could take for it: Docker normalises a platform before it matches it.
+    kinds = [platform(x) for x in m.get("manifests", [])]
+    amd = [x for x, k in zip(m.get("manifests", []), kinds) if k == "amd64"]
+    return depth == 0 and "like" not in kinds and len(amd) == 1 and names(amd[0], 1)
+print(c)
+for d in index:
+    if names(d, 0):
+        print(d["digest"])
+PY
+}
+
+load_release() { # load_release FOLDER: the images release.json names, checked by hash, then by id
+    local dir="$1" line file tag id got ids
+    [ -d "${dir}/images" ] || die "${dir} holds no images: the images of a card are pulled with --registry and --registry-token-file"
+    no_pulled "${dir}"
+    check_release "${dir}"
+    while IFS='|' read -r file tag id; do
+        [ "${DRY}" = 1 ] || ids="$(image_ids "${dir}/${file}" "${id}" "${tag}")" \
+            || die "the image file of ${tag} is not the image release.json names; nothing more was loaded"
+        run docker load --quiet --input "${dir}/${file}"
+        [ "${DRY}" = 1 ] && continue
+        got="$(docker image inspect --format '{{.Id}}' "${tag}" 2>/dev/null || true)"
+        if ! grep -qxF -- "${got:-none}" <<<"${ids}"; then
+            # A first install has no running tag: the one the load gave is taken away again.
+            docker image rm "${tag}" >/dev/null 2>&1 || warn "the tag ${tag} of the refused load was not taken away"
+            die "${tag} loaded as ${got:-nothing}, and release.json names ${id}"
+        fi
+    done < <(python3 -I -c '
+import json, os, sys
+d = sys.argv[1]
+for img in json.load(open(os.path.join(d, "release.json")))["images"].values():
+    print(img["file"] + "|" + img["tag"] + "|" + img["id"])' "${dir}")
+}
+
+# no_pulled FOLDER: a folder brought to this machine holds no pulled.json. Only a release pull writes
+# one, into the copy it keeps, from what it checked; a brought one would turn off the check of the image
+# files it names (security review of M17 phase 7).
+no_pulled() {
+    [ ! -e "$1/pulled.json" ] && [ ! -L "$1/pulled.json" ] \
+        || die "$1 holds a pulled.json, which only a release pull on this machine writes: release pull brings a card, release import a whole folder"
+}
+
+# keep_release FOLDER: a copy in the data folder's releases, root's, with no link, checked again
+# after the copy. A folder of that version that is there already must be the same release.
+keep_release() {
+    local v dst src; v="$(release_version "$1")"; dst="$(data_dir)/releases/${v}"; src="$(realpath -m -- "$1")"
+    [ "${src}" = "${dst}" ] && return 0
+    [ -n "${PULLED_FILE}" ] || no_pulled "$1"
+    if [ -e "${dst}" ]; then
+        cmp -s "$1/release.json" "${dst}/release.json" || die "another release ${v} is on this machine already; nothing was changed"
+        return 0
+    fi
+    [ -z "$(find "$1" -type l -print -quit)" ] || die "$1 holds a link: a release folder holds files only"
+    run install -d -m 0755 -o root -g root "$(dirname "${dst}")"
+    # A copy a run that stopped left is root's own, under the data folder: it goes first.
+    run rm -rf -- "${dst}.partial"
+    run cp -r --no-preserve=ownership,mode -- "$1" "${dst}.partial"
+    # What is checked is the copy, which no one else writes, not the folder it came from.
+    if [ "${DRY}" = 0 ]; then
+        if [ -n "$(find "${dst}.partial" -type l -print -quit)" ] || { [ -z "${PULLED_FILE}" ] && [ -e "${dst}.partial/pulled.json" ]; }; then
+            rm -rf -- "${dst}.partial"
+            die "$1 changed while it was copied: it holds a link, or a pulled.json, now; nothing was kept"
+        fi
+    fi
+    # A release pull's record of what it took from the registry, which only it writes (16.12); a card
+    # that brought one has it replaced.
+    [ -z "${PULLED_FILE}" ] || run install -m 0644 -o root -g root -- "${PULLED_FILE}" "${dst}.partial/pulled.json"
+    run chown -R root:root "${dst}.partial"
+    run chmod -R u=rwX,go=rX "${dst}.partial"
+    ( check_release "${dst}.partial" ) || { [ "${DRY}" = 1 ] || rm -rf -- "${dst}.partial"; die "the copy of $1 does not check; nothing was kept"; }
+    run mv -- "${dst}.partial" "${dst}"
+}
+
+# ─── Another installation (16.12; D48) ──────────────────────────────────────
+# A release of the main installation reaches another machine as a card, the release folder without its
+# images, which the operator copies there by hand, with its images pulled from the private registry
+# with a token that is used once, or as the whole folder, copied. The card is what that machine trusts:
+# each image is checked against the config digest its release.json names, which every image store
+# keeps, before it is pulled by the manifest that was checked.
+
+# read_token FILE: the token file, read once, into REG_USER and REG_TOKEN. Its one line is USER:TOKEN,
+# as docker login takes them. Neither is printed.
+REG_USER="" REG_TOKEN="" REG_CONFIG="" PULLED_FILE="" PULLED_TAGS=()
+read_token() {
+    [ -n "${REGISTRY}" ] || die "--registry HOST/PATH names the registry the images are pulled from, such as ghcr.io/owner"
+    [[ "${REGISTRY}" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)+$ ]] \
+        || die "--registry is HOST[:PORT]/PATH, such as ghcr.io/owner, in lower case"
+    [ -f "$1" ] && [ -r "$1" ] && [ ! -L "$1" ] || die "--registry-token-file: $(printable "$1") is no file this user can read"
+    # As given, before realpath took the link away; then root's or sudo's user's own, which no one
+    # else reads (security review of M17's Close).
+    [ ! -L "${REG_TOKEN_ARG:-$1}" ] || die "--registry-token-file: $(printable "${REG_TOKEN_ARG}") is a link"
+    # The checks and the read are of one open file, opened with no link followed, so the file cannot
+    # be swapped between them (security review of M17's Close, round 2).
+    local line
+    line="$(python3 -I - "$1" "${SUDO_UID:-}" 2>&1 <<'PY'
+import errno, os, stat, sys
+path, sudo = sys.argv[1], sys.argv[2]
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except OSError as e:
+    sys.exit("is a link" if e.errno == errno.ELOOP else "is no file this user can read")
+st = os.fstat(fd)
+if not stat.S_ISREG(st.st_mode):
+    sys.exit("is no file this user can read")
+if st.st_uid != os.getuid() and not (sudo and str(st.st_uid) == sudo):
+    sys.exit(f"is not yours: its owner is uid {st.st_uid}")
+if st.st_mode & 0o077:
+    sys.exit(f"may be read by others (mode {stat.S_IMODE(st.st_mode):o}): chmod 600 it")
+first = os.read(fd, 4096).split(b"\n", 1)[0].decode("utf-8", "replace")
+if not first.strip():
+    sys.exit("the file is empty")
+print(first)
+PY
+)" || die "--registry-token-file: $(printable "$1") ${line}"
+    line="${line%$'\r'}"
+    REG_USER="${line%%:*}" REG_TOKEN="${line#*:}"
+    { [ "${REG_USER}" != "${line}" ] && [ -n "${REG_USER}" ] && [ -n "${REG_TOKEN}" ]; } \
+        || die "--registry-token-file holds one line, USER:TOKEN"
+}
+
+# registry_login: one docker login into a folder of mktemp, which registry_logout removes, the login
+# with it; an exit on the way removes it too. The token goes to docker on its standard input.
+registry_login() {
+    local host="${REGISTRY%%/*}" err run d
+    # In /run, beside crew-ctl's lock: a tmpfs, so a run that is killed leaves no login on a disk past
+    # the next boot, and the next run removes it before its own.
+    run="$(dirname -- "${CTL_LOCK}")"
+    if [ "${DRY}" = 1 ]; then echo "+ docker login ${host} as ${REG_USER}, with the token on standard input, into a folder of mktemp in ${run}"; return; fi
+    for d in "${run}"/crew-login.??????; do
+        [ -d "${d}" ] && [ ! -L "${d}" ] && [ "$(stat -c %u -- "${d}")" = "$(id -u)" ] && rm -rf -- "${d}"
+    done
+    REG_CONFIG="$(mktemp -d -p "${run}" crew-login.XXXXXX)"
+    trap registry_logout EXIT
+    # A config that holds an entry for the registry already makes docker keep the login in it: an
+    # empty one has docker look for a credential store of its own, which would keep the token after
+    # this folder is gone (security review of M17 phase 7).
+    ( umask 077; printf '{"auths": {"%s": {}}}\n' "${host}" > "${REG_CONFIG}/config.json" )
+    if ! err="$(printf '%s\n' "${REG_TOKEN}" | docker --config "${REG_CONFIG}" login "${host}" -u "${REG_USER}" --password-stdin 2>&1 >/dev/null)"; then
+        registry_logout
+        die "the registry ${host} refused the login: $(printable "${err}" | tail -c 200)"
+    fi
+    REG_TOKEN=""
+    python3 -I -c '
+import json, sys
+c = json.load(open(sys.argv[1]))
+ok = not c.get("credsStore") and not c.get("credHelpers") and (c.get("auths", {}).get(sys.argv[2]) or {}).get("auth")
+sys.exit(0 if ok else 1)' "${REG_CONFIG}/config.json" "${host}" \
+        || { registry_logout; die "docker kept the login of ${host} somewhere else than its folder: the pull is refused"; }
+}
+registry_logout() { [ -z "${REG_CONFIG}" ] || rm -rf -- "${REG_CONFIG}"; REG_CONFIG=""; }
+
+# resolve_image REF CONFIG: what to pull for REF, as REPO@DIGEST, when it is an image whose config digest
+# is CONFIG: the manifest that was checked, an index followed to its one linux/amd64 manifest; a REF
+# pinned by an index's digest, PostgreSQL's, the index itself, which Compose finds it by and whose id the
+# containerd image store gives. Each digest is the hash of the bytes the registry gave, which docker pull
+# checks again.
+resolve_image() {
+    python3 -I - "${REG_CONFIG}" "$1" "$2" <<'PY'
+import hashlib, json, subprocess, sys
+config_dir, ref, want = sys.argv[1], sys.argv[2], sys.argv[3]
+repo = ref.rsplit("@", 1)[0]
+last = repo.rsplit("/", 1)[-1]
+if ":" in last:
+    repo = repo[: len(repo) - len(last)] + last.split(":", 1)[0]
+def raw(r):
+    p = subprocess.run(["docker", "--config", config_dir, "buildx", "imagetools", "inspect", "--raw", r],
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+    if p.returncode != 0:
+        sys.exit(f"{r}: {p.stderr.decode(errors='replace').strip()[-200:]}")
+    return p.stdout, "sha256:" + hashlib.sha256(p.stdout).hexdigest()
+body, digest = raw(ref)
+top = digest
+if "@" in ref and digest != ref.rsplit("@", 1)[1]:
+    sys.exit(f"{ref}: the registry gave a manifest of another hash")
+m = json.loads(body)
+if "manifests" in m:
+    # One manifest for exactly linux/amd64 and no other entry Docker could take for it: Docker
+    # normalises a platform (case, x86_64, a variant) before it matches it (security review of M17's
+    # Close, round 2). Other platforms, as PostgreSQL's index has them, stay.
+    def platform(d):
+        # "amd64" for exactly linux/amd64; "like" for another entry Docker could take for it once it
+        # normalised it (case, x86_64, a variant, an empty field, no platform); "other" for another platform.
+        p = d.get("platform") or {}
+        if p == {"os": "linux", "architecture": "amd64"}:
+            return "amd64"
+        os_, arch = str(p.get("os", "")).lower(), str(p.get("architecture", "")).lower()
+        return "like" if os_ in ("linux", "") and arch in ("amd64", "x86_64", "x86-64", "") else "other"
+    amd = [d for d in m["manifests"] if platform(d) == "amd64"]
+    if len(amd) != 1 or any(platform(d) == "like" for d in m["manifests"]):
+        sys.exit(f"{ref} is an index with {len(amd)} manifests for exactly linux/amd64, or another Docker could take for it: Docker could take another than the one checked")
+    body, digest = raw(repo + "@" + amd[0]["digest"])
+    if digest != amd[0]["digest"]:
+        sys.exit(f"{ref}: the registry gave a manifest of another hash than its index names")
+    m = json.loads(body)
+got = m.get("config", {}).get("digest", "")
+if got != want:
+    sys.exit(f"{ref} is the image {got[:19] or 'with no config'}, and release.json names {want[:19]}")
+# An index is pulled as itself only when its digest is pinned, PostgreSQL's by the lock, which Compose
+# names it by; any other image by the manifest that was checked (security review of M17 phase 7, round 2).
+print(repo + "@" + (top if "@" in ref else digest))
+PY
+}
+
+# pull_images CARD: each image the card's release.json names, checked by resolve_image, pulled by the
+# digest it gives, given the tag release.json names, and checked again by its id; pulled.json then
+# records what was taken. Crew's images come from REGISTRY/NAME:VERSION; PostgreSQL's from Docker Hub by
+# the digest of the versions.lock in the card's deploy archive, which release.json names by its hash,
+# since the library moves its tags. A tag that names another image already is never moved. On any
+# refusal what this pull tagged is untagged.
+pull_images() {
+    local dir="$1" v list name tag id ref pin got had entries=()
+    v="$(release_version "${dir}")"
+    list="$(python3 -I - "${dir}" "${REGISTRY}" "${v}" <<'PY'
+import hashlib, io, json, os, re, sys, tarfile
+d, registry, v = sys.argv[1], sys.argv[2], sys.argv[3]
+m = json.load(open(os.path.join(d, "release.json")))
+dep = m.get("deploy") or {}
+if dep.get("file") != "deploy.tar.gz" or not dep.get("sha256"):
+    sys.exit("release.json names no deploy archive")
+data = open(os.path.join(d, "deploy.tar.gz"), "rb").read()
+if hashlib.sha256(data).hexdigest() != dep["sha256"]:
+    sys.exit("the deploy archive does not have the hash release.json names")
+with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+    lock = tf.extractfile("versions.lock").read().decode()
+pg = re.search(r"^POSTGRES_IMAGE=(postgres:[A-Za-z0-9._-]+)@(sha256:[0-9a-f]{64})$", lock, re.M)
+if not pg:
+    sys.exit("the deploy archive's versions.lock names no POSTGRES_IMAGE by its digest")
+# The parts of a release, each by the tag Verify holds it to (internal/release).
+parts = ["crew-server", "crew-caddy", "crew-runtime", "crew-updater", "postgres"]
+if sorted(m["images"]) != sorted(parts):
+    sys.exit("release.json names other images than a release's: " + ", ".join(sorted(m["images"]))[:200])
+for name in parts:
+    img = m["images"][name]
+    tag, iid = img.get("tag", ""), img.get("id", "")
+    want = "postgres:" if name == "postgres" else name + ":" + v
+    if (tag != want if name != "postgres" else not re.fullmatch(r"postgres:[A-Za-z0-9._-]+", tag)) \
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", iid):
+        sys.exit("release.json names the image " + name + " as " + repr(tag)[:60] + ", not " + want + " with its id")
+    if name == "postgres":
+        if tag != pg.group(1):
+            sys.exit(tag + " is not the image the deploy archive's versions.lock pins, " + pg.group(1))
+        ref = "docker.io/library/postgres@" + pg.group(2)
+    else:
+        ref = registry + "/" + name + ":" + v
+    print("|".join((name, tag, iid, ref)))
+PY
+)" || die "the card ${dir} cannot be pulled; nothing was changed"
+    if [ "${DRY}" = 1 ]; then
+        while IFS='|' read -r name tag id ref; do
+            echo "+ docker pull ${ref} by the digest of what was checked, once its linux/amd64 config is ${id}; tag it ${tag}"
+        done <<<"${list}"
+        PULLED_FILE="<pulled.json of mktemp>"
+        return 0
+    fi
+    while IFS='|' read -r name tag id ref; do
+        pin="$(resolve_image "${ref}" "${id}" </dev/null)" || pull_failed "${tag} was not pulled"
+        had="$(docker image inspect --format '{{.Id}}' "${tag}" 2>/dev/null </dev/null || true)"
+        if [ -n "${had}" ] && [ "${had}" != "${id}" ] && [ "${had}" != "${pin#*@}" ]; then
+            pull_failed "${tag} names another image on this machine already (${had:0:19}): it is not moved"
+        fi
+        docker --config "${REG_CONFIG}" pull --quiet "${pin}" >/dev/null </dev/null || pull_failed "${pin} could not be pulled"
+        if [ -z "${had}" ]; then
+            docker tag "${pin}" "${tag}" </dev/null || pull_failed "${tag} could not be given to ${pin}"
+            PULLED_TAGS+=("${tag}")
+        fi
+        # The registry's name goes; PostgreSQL's by its digest stays, which Compose names it by.
+        [ "${name}" = postgres ] || docker image rm "${pin}" >/dev/null 2>&1 </dev/null || true
+        got="$(docker image inspect --format '{{.Id}}' "${tag}" 2>/dev/null </dev/null || true)"
+        [ "${got}" = "${id}" ] || [ "${got}" = "${pin#*@}" ] || pull_failed "${tag} was pulled as ${got:-nothing}, and release.json names ${id}"
+        entries+=("${name}|${id}|${pin#*@}|${ref}")
+        log "pulled ${tag} from ${ref}"
+    done <<<"${list}"
+    PULLED_FILE="$(mktemp)"
+    printf '%s\n' "${entries[@]}" | python3 -I -c '
+import json, sys
+images = {}
+for line in sys.stdin.read().splitlines():
+    name, config, manifest, ref = line.split("|")
+    images[name] = {"config": config, "manifest": manifest, "from": ref}
+json.dump({"version": sys.argv[2], "images": images}, open(sys.argv[1], "w"), indent=2)' "${PULLED_FILE}" "${v}" \
+        || pull_failed "pulled.json could not be written"
+}
+
+pull_failed() { # pull_failed WHY: undoes the tags this pull gave, and stops
+    local t
+    for t in "${PULLED_TAGS[@]}"; do docker image rm "${t}" >/dev/null 2>&1 || warn "the tag ${t} of the refused pull was not taken away"; done
+    PULLED_TAGS=()
+    [ -z "${PULLED_FILE}" ] || rm -f -- "${PULLED_FILE}"
+    PULLED_FILE=""
+    registry_logout
+    die "$1; the pull is refused, and what it tagged is taken away"
+}
+
+# own_folder DIR: DIR, resolved, when root may write into it what another machine trusts: a folder of
+# root's, of whoever ran sudo, or of the caller, which others may write to only when it is sticky
+# (security review of M17 phase 7).
+own_folder() {
+    local out own mode
+    out="$(realpath -m -- "$1")"
+    [ -d "${out}" ] && [ ! -L "${out}" ] || die "--out ${out} is no folder"
+    own="$(stat -c %u -- "${out}")"; mode="$(stat -c %a -- "${out}")"
+    [ "${own}" = 0 ] || [ "${own}" = "${SUDO_UID:-0}" ] || [ "${own}" = "$(id -u)" ] || die "${out} belongs to another user"
+    if (( (8#${mode} & 8#022) != 0 && (8#${mode} & 8#1000) == 0 )); then die "others may write to ${out}, and it is not sticky"; fi
+    echo "${out}"
+}
+
+# release_card VERSION: the card of a release of this machine, into --out (default .): its release
+# folder without the images, to be copied to another installation (16.12).
+release_card() {
+    need_root
+    local v="$1" src out dst f
+    valid_version "${v}" || die "release card X.Y.Z [--out DIR]"
+    src="$(data_dir)/releases/${v}"
+    [ -f "${src}/release.json" ] || die "there is no release ${v} on this machine"
+    out="$(realpath -m -- "${OUT_DIR:-.}")"; dst="${out}/${v}"
+    [ -e "${dst}" ] || [ -L "${dst}" ] && die "${dst} is there already"
+    [ -f "${src}/gate.json" ] || warn "${v} has no gate.json: another installation installs no release without a gate that passed"
+    # The card is what another machine trusts, its crew-ctl included: it is written into a folder of
+    # root's, of whoever ran sudo, or of the caller, which others may write to only when it is sticky,
+    # and into a new folder of its own there first (security review of M17 phase 7).
+    out="$(own_folder "${out}")"
+    local partial
+    if [ "${DRY}" = 1 ]; then partial="${out}/.crew-card.XXXXXX"; else partial="$(mktemp -d -p "${out}" .crew-card.XXXXXX)"; chmod 0755 "${partial}"; fi
+    for f in release.json gate.json notes.md "$(python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); print((m.get("deploy") or {}).get("file",""))' "${src}/release.json")" \
+             "$(python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); print((m.get("browser") or {}).get("file",""))' "${src}/release.json")"; do
+        [ -n "${f}" ] && [ -f "${src}/${f}" ] || continue
+        [[ "${f}" =~ ^[a-z0-9._-]+$ ]] || die "release.json of ${v} names the file $(printable "${f}")"
+        run install -m 0644 -- "${src}/${f}" "${partial}/${f}"
+    done
+    run mv -T -- "${partial}" "${dst}"
+    log "the card of ${v} is in ${dst}. On the other machine: unpack its deploy.tar.gz, then crew-ctl release pull (or install --from on a fresh machine) with --registry and --registry-token-file"
+}
+
+# release_pull CARD: a later release on another installation: its images pulled and checked, the card
+# kept as its release folder with pulled.json. It waits for Install there (16.12).
+release_pull() {
+    need_root
+    ctl_lock
+    [ -f "${INSTALL_JSON}" ] || die "Crew is not installed: a first install pulls with install --from CARD --registry-token-file FILE"
+    local dir="$1" v
+    v="$(release_version "${dir}")"
+    [ -e "$(data_dir)/releases/${v}" ] && die "the release ${v} is on this machine already"
+    read_token "${REG_TOKEN_FILE}"
+    registry_login
+    pull_images "${dir}"
+    registry_logout
+    keep_release "${dir}"
+    [ "${DRY}" = 1 ] || rm -f -- "${PULLED_FILE}"
+    log "the release ${v} is on this machine; it waits for Install in Versions"
+}
+
+# release_import FOLDER: a later release on another installation from a whole folder that was copied;
+# the updater loads and checks its images when it is installed. It waits for Install there (16.12).
+release_import() {
+    need_root
+    ctl_lock
+    [ -f "${INSTALL_JSON}" ] || die "Crew is not installed: a first install takes install --from FOLDER"
+    local dir="$1" v
+    v="$(release_version "${dir}")"
+    [ -e "$(data_dir)/releases/${v}" ] && die "the release ${v} is on this machine already"
+    no_pulled "${dir}"
+    check_release "${dir}"
+    keep_release "${dir}"
+    log "the release ${v} is on this machine; it waits for Install in Versions"
+}
+
+cmd_release() {
+    local how="release card X.Y.Z [--out DIR] | release pull CARD --registry HOST/PATH --registry-token-file FILE | release import FOLDER"
+    [ $# = 2 ] || die "${how}"
+    case "$1" in
+        card) release_card "$2" ;;
+        pull) [ -n "${REG_TOKEN_FILE}" ] || die "release pull needs --registry-token-file FILE"; release_pull "$(realpath -m -- "$2")" ;;
+        import) release_import "$(realpath -m -- "$2")" ;;
+        *) die "${how}" ;;
+    esac
+}
+
+# agent_lines: the model and effort lines of each agent file at HEAD, for release.json (16.3).
+agent_lines() {
+    local p
+    while IFS= read -r p; do
+        git_repo show "HEAD:${p}" | awk -v p="${p}" 'NR==1 && $0!="---" {exit} NR>1 && $0=="---" {exit} NR>1 && /^(model|effort):/ {print "agent " p "\t" $0}'
+    done < <(git_repo ls-tree -r --name-only HEAD | grep -E '^(harness|baseline)/agents/[^/]+\.md$' || true)
+}
+
+# release_notes VERSION COMMIT PREV: notes.md of a release (16.9), the commits since the release
+# before, PREV, until tickets write them (M16).
+release_notes() {
+    local v="$1" commit="$2" prev="$3"
+    # The title, given at the build, names the release on the Versions screen and the Baseline's
+    # card; without one they take the first commit line (M15 on dave: commit lines read as titles).
+    if [ -n "${TITLE_ARG}" ]; then echo "# Crew ${v}: ${TITLE_ARG}"; else echo "# Crew ${v}"; fi
+    echo
+    if [ -n "${prev}" ] && git_repo cat-file -e "${prev}^{commit}" 2>/dev/null; then
+        echo "The commits since ${prev:0:12}:"; echo
+        git_repo log --no-merges --format='- %s (%h)' "${prev}..${commit}"
+    else
+        echo "The last commits:"; echo
+        git_repo log --no-merges --format='- %s (%h)' -n 30 "${commit}"
+    fi
+}
+
+# write_release VERSION: the release folder of REPO's HEAD (16.1), by deploy/release.sh, the script a
+# release Crew builds runs too (16.2): the commit is exported with git archive, its images are built
+# from that tree and saved as files, and release.json, with the runtime image's inputs and the deploy
+# archive, is written by the release's own server program. Only the notes are this script's.
+write_release() { # write_release VERSION [ROOT]: into ROOT, the data folder's releases by default
+    local v="$1" root="${2:-$(data_dir)/releases}" dir tmp commit tree prev out
+    dir="${root}/${v}"; tmp="${root}/.${v}.partial"; tree="${root}/.${v}.tree"
+    [ -e "${dir}" ] && die "the release ${v} is already on this machine: a version is built once"
+    commit="$(git_repo rev-parse HEAD)"
+    if [ "${DRY}" = 1 ]; then
+        local lock
+        lock="$(mktemp)"
+        git_repo show "${commit}:versions.lock" > "${lock}" 2>/dev/null || true
+        echo "+ git archive ${commit:0:12} into ${tree}"
+        fetch_agy "${lock}" "<a folder of mktemp>" || { rm -f -- "${lock}"; exit 1; }
+        rm -f -- "${lock}"
+        echo "+ bash ${SELF_DIR}/release.sh build --tree ${tree} --version ${v} --out ${tmp} --agy <a folder of mktemp>"
+        echo "+ bash ${SELF_DIR}/release.sh write --tree ${tree} --tree-tar ${tree}.tar --version ${v} --out ${tmp} --commit ${commit} --facts ${tree}.facts --machine-setup $(lock_value MACHINE_SETUP)"
+        echo "+ write the release folder ${dir} of ${commit}"
+        return
+    fi
+    log "the release folder of ${v}, from ${commit:0:12}"
+    rm -rf -- "${tmp}" "${tree}" "${tree}.tar" "${tree}.facts"
+    install -d -m 0755 "${root}" "${tree}"
+    git_repo archive --format=tar -o "${tree}.tar" "${commit}" || die "the commit could not be exported"
+    tar -xf "${tree}.tar" -C "${tree}" || die "the exported tree could not be unpacked"
+    { git_repo ls-tree -r "${commit}"; agent_lines; } > "${tree}.facts"
+    local agy
+    agy="$(mktemp -d)"
+    fetch_agy "${tree}/versions.lock" "${agy}" || { rm -rf -- "${agy}"; exit 1; }
+    out="$(mktemp)"
+    if bash "${SELF_DIR}/release.sh" build --tree "${tree}" --version "${v}" --out "${tmp}" --agy "${agy}" > "${out}" 2>&1; then
+        rm -f "${out}"; rm -rf -- "${agy}"
+    else
+        tail -60 "${out}" >&2; rm -f "${out}"; rm -rf -- "${agy}"
+        die "the build of ${v} failed (its last lines are above)"
+    fi
+    bash "${SELF_DIR}/release.sh" write --tree "${tree}" --tree-tar "${tree}.tar" --version "${v}" --out "${tmp}" \
+        --commit "${commit}" --facts "${tree}.facts" --machine-setup "$(lock_value MACHINE_SETUP)" \
+        || die "release.json of ${v} was not written"
+    # The notes (16.9): the commits since the release before, until tickets write them (M16).
+    prev="$(python3 -I - "${root}" "${v}" <<'PY' 2>/dev/null || true
+import json, os, re, sys
+root, v = sys.argv[1], sys.argv[2]
+def key(s):
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", s)
+    return tuple(int(x) for x in m.groups()) if m else (-1,)
+best = None
+for name in os.listdir(root):
+    p = os.path.join(root, name, "release.json")
+    if name.startswith(".") or not os.path.isfile(p) or key(name) >= key(v):
+        continue
+    if best is None or key(name) > key(best[0]):
+        best = (name, json.load(open(p)).get("commit", ""))
+print(best[1] if best else "")
+PY
+)"
+    release_notes "${v}" "${commit}" "${prev}" > "${tmp}/notes.md"
+    rm -rf -- "${tree}" "${tree}.tar" "${tree}.facts"
+    mv -- "${tmp}" "${dir}"
+    log "the release ${v} is in ${dir}"
+}
+
+# check_title TEXT: a release's title is one line of at most 120 characters, with no control,
+# invisible, or direction-changing character, which could make it read as another on the Versions
+# screen and GitHub's release page (security review of 0.50). Python counts characters, not bytes.
+check_title() {
+    [ -z "$1" ] && return 0
+    local why
+    why="$(python3 -I - "$1" <<'PY'
+import sys, unicodedata
+t = sys.argv[1]
+if any(unicodedata.category(c)[0] in "CZ" and c != " " for c in t):
+    print("--title is one line, with no control, invisible, or direction-changing character")
+elif len(t) > 120:
+    print(f"--title has {len(t)} characters: at most 120")
+elif not t.strip():
+    print("--title is empty")
+PY
+)" || die "--title could not be checked"
+    [ -z "${why}" ] || die "${why}"
+}
+
+cmd_build() {
+    need_root
+    REPO="$(cd "${SELF_DIR}/.." && pwd)"
+    [ -f "${REPO}/deploy/compose.yaml" ] || die "run build from a checkout: deploy/crew-ctl build --version X.Y.Z"
+    [ -n "${VERSION_ARG}" ] || die "build needs --version X.Y.Z: a release's number is chosen, never guessed"
+    [[ "${VERSION_ARG}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "${VERSION_ARG} is not X.Y.Z"
+    check_title "${TITLE_ARG}"
+    [ -z "$(git_repo status --porcelain)" ] || die "the checkout has changes that are not committed: a release is built from a commit"
+    # --out builds a release this machine does not take: into a folder of its own, which neither the
+    # updater nor Versions reads, such as the install test's (phase second) for another machine.
+    if [ -n "${OUT_DIR}" ]; then
+        local out; out="$(own_folder "${OUT_DIR}")"
+        write_release "${VERSION_ARG}" "${out}"
+        log "the release ${VERSION_ARG} is in ${out}/${VERSION_ARG}; this machine's updater does not see it"
+        return
+    fi
+    [ -e "$(data_dir)/releases/${VERSION_ARG}" ] && die "the release ${VERSION_ARG} is already on this machine: a version is built once"
+    write_release "${VERSION_ARG}"
+    log "next: crew-ctl gate ${VERSION_ARG}"
+}
+
+# updater_call METHOD PATH [BODY]: one request on the updater's socket. It prints the answer, then
+# its status code on a line of its own.
+updater_call() {
+    local args=(-sS --max-time 30 --unix-socket "${UPDATER_SOCK}" -X "$1" -w '\n%{http_code}\n')
+    [ -z "${3:-}" ] || args+=(-H 'Content-Type: application/json' --data "$3")
+    curl "${args[@]}" "http://updater$2" || { echo; echo 000; }
+}
+
+# follow ID: the request's steps as they come, until it ends; 0 when it is done.
+follow() {
+    local id="$1" seen=0 out
+    for _ in $(seq 1 1800); do
+        out="$(updater_call GET /status | sed '$d')"
+        seen="$(printf '%s' "${out}" | python3 -I -c '
+import json, sys, unicodedata
+id, seen = int(sys.argv[1]), int(sys.argv[2])
+# The detail of a step and the error of a request can hold output of code agents wrote: shown as
+# one line of text, with no control or format character, so that no line of it passes for one of
+# these (security review of the restore, rounds 1 and 2).
+def text(t):
+    t = t.replace("\n", " ").replace("\t", " ")
+    return "".join(c for c in t if unicodedata.category(c) not in ("Cc", "Cf", "Zl", "Zp"))
+try:
+    st = json.load(sys.stdin)
+except ValueError:
+    print(seen); sys.exit(0)
+req = st.get("current") if (st.get("current") or {}).get("id") == id else None
+if req is None:
+    req = next((r for r in st.get("requests", []) if r.get("id") == id), None)
+if req is None:
+    print(seen); sys.exit(0)
+steps = req.get("steps") or []
+for s in steps[seen:]:
+    print(("  ok " if s["ok"] else "  -- ") + text(s["name"]) + ": " + text(s["detail"]), file=sys.stderr)
+done = req.get("state") not in ("running", "asked")
+print(len(steps) if not done else "end:" + text(req["state"]) + ":" + text(req.get("error") or ""))' "${id}" "${seen}")"
+        case "${seen}" in
+            end:done:*) return 0 ;;
+            end:*) seen="${seen#end:}"; warn "${seen%%:*}: ${seen#*:}"; return 1 ;;
+        esac
+        sleep 2
+    done
+    die "the request ${id} did not end in an hour: crew-ctl status"
+}
+
+# ask_updater VERSION BYHAND: asks the updater to install VERSION, the same way the app does (16.4).
+ask_updater() {
+    local body out code id
+    body="$(python3 -I -c 'import json,sys; print(json.dumps({"version": sys.argv[1], "askedBy": "crew-ctl", "byHand": sys.argv[2] == "1", "confirm": sys.argv[3]}))' \
+        "$1" "$2" "${CONFIRM_GIVEN}")"
+    [ "${DRY}" = 1 ] && { echo "+ ask the updater over ${UPDATER_SOCK}: POST /install ${body}"; return; }
+    [ -S "${UPDATER_SOCK}" ] || die "the updater does not answer: ${UPDATER_SOCK} is not there (crew-ctl status)"
+    out="$(updater_call POST /install "${body}")"
+    code="$(printf '%s\n' "${out}" | tail -1)"; out="$(printf '%s\n' "${out}" | sed '$d')"
+    case "${code}" in
+        202) ;;
+        409) die "the updater is busy with another request (crew-ctl status)" ;;
+        422) die "the updater refused: $(printf '%s' "${out}" | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)" ;;
+        *) die "the updater answered ${code}: $(printable "${out}")" ;;
+    esac
+    id="$(printf '%s' "${out}" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+    log "the updater took request ${id}: $1"
+    follow "${id}" || die "Crew ${1} was not installed; the updater says why above"
+    log "Crew $1 runs"
+}
+
+newest_release() { # newest_release: the newest release folder with a passed gate, by its number
+    python3 -I - "$(data_dir)/releases" <<'PY'
+import json, os, re, sys
+root = sys.argv[1]
+def key(s):
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", s)
+    return tuple(int(x) for x in m.groups()) if m else None
+best = None
+for name in os.listdir(root) if os.path.isdir(root) else []:
+    if key(name) is None or not os.path.isfile(os.path.join(root, name, "gate.json")):
+        continue
+    try:
+        if not json.load(open(os.path.join(root, name, "gate.json"))).get("passed"):
+            continue
+    except ValueError:
+        continue
+    if best is None or key(name) > key(best):
+        best = name
+print(best or "")
+PY
+}
+
+# newer A B: whether version A is newer than B, by their numbers.
+newer() {
+    python3 -I - "$1" "$2" <<'PY'
+import re, sys
+def key(v):
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", v)
+    return tuple(int(x) for x in m.groups()) if m else (-1,)
+sys.exit(0 if key(sys.argv[1]) > key(sys.argv[2]) else 1)
+PY
+}
+
+cmd_update() {
+    need_root
+    [ -f "${INSTALL_JSON}" ] || die "Crew is not installed"
+    local v="${VERSION_ARG}" running
+    running="$(installed_version)"
+    [ -n "${v}" ] || v="$(newest_release)"
+    [ -n "${v}" ] || die "there is no release that passed the gate on this machine"
+    valid_version "${v}" || die "${v} is not a version"
+    [ "${v}" != "${running}" ] || { log "Crew ${v} runs already"; return 0; }
+    # An update goes forward; going back is crew-ctl rollback, which says so (16.5).
+    newer "${v}" "${running}" || die "${v} is not newer than ${running}, which runs: crew-ctl rollback --version ${v}"
+    ask_updater "${v}" 0
+}
+
+cmd_rollback() {
+    need_root
+    [ -f "${INSTALL_JSON}" ] || die "Crew is not installed"
+    local v="${VERSION_ARG}"
+    [ -n "${v}" ] || v="$(updater_state previous)"
+    [ -n "${v}" ] || die "there is no version before this one: rollback --version X.Y.Z"
+    valid_version "${v}" || die "${v} is not a version"
+    # A version install built has no gate: root rolls back to it as a build by hand (16.10).
+    local byhand=0
+    [ -f "$(data_dir)/releases/${v}/gate.json" ] || byhand=1
+    ask_updater "${v}" "${byhand}"
+}
+
+# install_by_hand: a release folder that did not pass the gate, given by root, after a word (16.10).
+install_by_hand() {
+    need_root
+    local v; v="$(release_version "${FROM_DIR}")"
+    log "a build by hand: ${v} from ${FROM_DIR}. It has not passed the gate; the updater still checks it beside the running version, switches, and watches"
+    [ "${DRY}" = 1 ] || confirm_word install
+    check_release "${FROM_DIR}"
+    keep_release "${FROM_DIR}"
+    if [ "${DRY}" = 0 ]; then
+        python3 -I - "$(data_dir)/releases/${v}" <<'PY'
+import hashlib, json, os, sys
+d = sys.argv[1]
+p = os.path.join(d, "release.json")
+g = os.path.join(d, "gate.json")
+body = open(p, "rb").read()
+m = json.loads(body)
+passed = False
+if os.path.isfile(g):
+    try:
+        gate = json.load(open(g))
+        passed = (gate.get("version") == m.get("version")
+                  and gate.get("manifestSha256") == hashlib.sha256(body).hexdigest()
+                  and gate.get("passed") is True
+                  and gate.get("live", "") in ("", "passed", "skipped"))
+    except Exception:
+        passed = False
+if not passed:
+    if os.path.exists(g):
+        os.remove(g)
+    if not m.get("byHand"):
+        m["byHand"] = True
+        tmp = p + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(m, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, p)
+PY
+    fi
+    ask_updater "${v}" 1
+}
+
+# ─── The gate (16.2; 0.48, 0.52) ────────────────────────────────────────────
+# gate VERSION: the tests on the built images of a release folder. Here, make check at its commit and the
+# install test on a fresh virtual machine where updates.install_test is local; then the updater, over its
+# socket, the rest: the release in check mode beside the running Crew on a scratch copy of the database,
+# from a spec the updater writes itself, with no Docker socket; the smoke microVM it starts; the selftest;
+# and the browser tests of the screens, which only read. The updater writes gate.json, bound to the
+# folder's release.json, with the live part pending: the running Crew runs the live steps and sends their
+# result (16.2 step 5). Pending is never passed, and the updater installs no release without a passed gate,
+# but root's build by hand.
+GATE_STEPS=()
+gate_step() { # gate_step NAME CMD...: runs one step of the gate, and records whether it passed
+    local name="$1" out rc=0; shift
+    log "the gate: ${name}"
+    if [ "${DRY}" = 1 ]; then echo "+ $*"; GATE_STEPS+=("${name}|1|"); return 0; fi
+    out="$("$@" 2>&1)" || rc=$?
+    if [ "${rc}" = 0 ]; then printf '%s\n' "${out}" | tail -20; else printf '%s\n' "${out}" | tail -200; fi
+    if [ "${rc}" = 0 ]; then GATE_STEPS+=("${name}|1|"); else GATE_STEPS+=("${name}|0|$(printf '%s' "${out}" | tail -1 | tr -d '|' | cut -c1-200)"); fi
+    return "${rc}"
+}
+
+as_operator() { # as_operator CMD...: the checkout's owner, for what writes in the checkout
+    local owner; owner="$(stat -c %U "${REPO}")"
+    if [ "${owner}" != root ]; then sudo -u "${owner}" -- "$@"; else "$@"; fi
+}
+
+install_test_setting() { # the setting updates.install_test as the running Crew has it: local or off
+    docker exec crew-server crew admin settings export 2>/dev/null | python3 -I -c '
+import sys, re
+text = sys.stdin.read()
+m = re.search(r"^updates:\n((?:[ \t].*\n)*)", text, re.M)
+v = re.search(r"^\s+install_test:\s*[\x27\x22]?(\w+)", m.group(1), re.M) if m else None
+print(v.group(1) if v else "unread")'
+}
+
+# gate_body FOLDER INSTALLTEST NOTE: the gate's request to the updater, with GATE_STEPS, bound to the
+# folder's release.json by its hash.
+gate_body() {
+    local stepfile; stepfile="$(mktemp)"
+    printf '%s\n' "${GATE_STEPS[@]}" > "${stepfile}"
+    python3 -I - "$1" "$2" "$3" "${stepfile}" <<'PY'
+import hashlib, json, os, sys
+d, itest, note, stepfile = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+body = open(os.path.join(d, "release.json"), "rb").read()
+steps = []
+for line in open(stepfile).read().splitlines():
+    if line:
+        name, ok, detail = line.split("|", 2)
+        steps.append({"name": name, "ok": ok == "1", "detail": detail})
+gate = {"manifestSha256": hashlib.sha256(body).hexdigest(), "steps": steps, "installTest": itest}
+if note:
+    gate["installTestNote"] = note
+print(json.dumps({"version": json.loads(body)["version"], "askedBy": "crew-ctl", "gate": gate}))
+PY
+    local rc=$?
+    rm -f "${stepfile}"
+    return "${rc}"
+}
+
+# gate_install_test RC: the install test of a gate whose steps before it ended with RC, as ITEST and
+# NOTE. Where updates.install_test is local it runs; the note says why it did not, and names the setting
+# off only when it was read so (review of M16, F4).
+gate_install_test() {
+    ITEST="skipped" NOTE=""
+    if [ "$1" != 0 ]; then NOTE="the install test did not run: an earlier step of the gate failed"; return 0; fi
+    if [ "${DRY}" = 1 ]; then NOTE="the install test did not run: a dry run reads no setting"; return 0; fi
+    local setting; setting="$(install_test_setting)"
+    log "the gate: updates.install_test is ${setting}"
+    # What the server said, when its answer could not be read.
+    [ "${setting}" != unread ] || docker exec crew-server crew admin settings export 2>&1 | tail -5 >&2 || true
+    case "${setting}" in
+        local)
+            if gate_step "the install test on a fresh virtual machine" as_operator make -C "${REPO}" install-test DISTRO=debian PHASE=cycle; then ITEST=passed
+            else ITEST=failed; fi ;;
+        off) NOTE="updates.install_test is off" ;;
+        *)
+            NOTE="the install test did not run: updates.install_test could not be read"
+            GATE_STEPS+=("the setting updates.install_test|0|it could not be read") ;;
+    esac
+}
+
+cmd_gate() {
+    need_root
+    [ -f "${INSTALL_JSON}" ] || die "the gate runs a release beside the running Crew: install Crew first"
+    REPO="$(cd "${SELF_DIR}/.." && pwd)"
+    [ -f "${REPO}/deploy/compose.yaml" ] || die "run gate from the checkout the release was built from"
+    local v="${1:-}" dir commit head itest note rc=0 out id body
+    [ -n "${v}" ] || die "gate X.Y.Z"
+    valid_version "${v}" || die "${v} is not a version"
+    dir="$(data_dir)/releases/${v}"
+    [ "$(release_version "${dir}")" = "${v}" ] || die "no release folder ${v}"
+    load_answers
+    commit="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' "${dir}/release.json")"
+    head="$(git_repo rev-parse HEAD)"
+    [ "${head}" = "${commit}" ] || die "the checkout is at ${head:0:12}, and ${v} was built from ${commit:0:12}: check out that commit"
+    [ -z "$(git_repo status --porcelain)" ] || die "the checkout has changes that are not committed"
+    have make || die "the gate runs make check: install make on this machine first (the machine Crew runs on needs none)"
+    GATE_STEPS=()
+    gate_step "the images have the hashes release.json names" check_release "${dir}" || rc=1
+    [ "${rc}" = 0 ] && { gate_step "make check at ${commit:0:12}" as_operator make -C "${REPO}" check || rc=1; }
+    gate_install_test "${rc}"
+    itest="${ITEST}" note="${NOTE}"
+    body="$(gate_body "${dir}" "${itest}" "${note}")" || die "the gate's request could not be written"
+    if [ "${DRY}" = 1 ]; then echo "+ ask the updater for the gate of ${v}: POST /gate ${body}"; return 0; fi
+    out="$(updater_call POST /gate "${body}")"
+    if [ "$(printf '%s\n' "${out}" | tail -1)" != 202 ]; then
+        die "the updater refused the gate of ${v}: $(printf '%s' "${out}" | sed '$d' | cut -c1-400)"
+    fi
+    id="$(printf '%s\n' "${out}" | sed '$d' | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+    if follow "${id}"; then
+        log "${v} passed the gate's steps (the install test: ${itest}). Its live steps wait for the running Crew: at once when only text changed, else after Run the live gate on Versions"
+    else
+        die "${v} did not pass the gate: ${dir}/gate.json says where"
+    fi
+}
+
+# Proof (16.11, M1): one microVM starts with Kata's own kernel, the firewall test passes from inside
+# it, the server answers behind the ingress, and a row is written and read back. From M3 also: an
+# event a microVM prints is stored.
+cmd_proof() {
+    need_root
+    [ -f "${ENV_FILE}" ] || die "Crew is not installed"
+    [ -n "${A_CREW_HOSTNAME:-}" ] || load_answers
+    local proof="${DEPLOY}/proof.sh" health tls=()
+    [ "${DRY}" = 1 ] && { echo "+ ${proof}"; echo "+ admin proof"; echo "+ admin proof event"; return; }
+    PROOF_IMAGE="$(lock_value RUNTIME_BASE_IMAGE)" bash "${proof}" || die "the sandbox proof failed"
+    # Certificates that are not real ones are not checked here; their names are.
+    [ "${A_CREW_TLS}" = acme ] || tls=(--insecure)
+    health="$(curl -sS --max-time 15 --resolve "${A_CREW_HOSTNAME}:443:127.0.0.1" "${tls[@]}" \
+        "https://${A_CREW_HOSTNAME}/healthz" 2>&1 || true)"
+    [[ "${health}" == *'"database":"ok"'* ]] || die "the server does not answer behind the ingress: $(printable "${health}")"
+    log "the server answers behind the ingress: $(printable "${health}")"
+    admin proof
+    # From M3: an event a microVM prints is stored. It needs Docker and a sandbox's network, so it
+    # runs in the server's container, not in the admin's.
+    docker exec crew-server crew admin proof event || die "an event a microVM printed was not stored"
+}
+
+# ─── Status (16.11) ─────────────────────────────────────────────────────────
+cmd_status() {
+    local installed=0 v="" c st problems=0 rows=()
+    [ -f "${INSTALL_JSON}" ] && installed=1 && v="$(installed_version)"
+    if [ "${installed}" = 1 ]; then
+        for c in "${CONTAINERS[@]}"; do
+            st="$(docker inspect -f '{{.State.Status}}{{if .State.Health}}/{{.State.Health.Status}}{{end}}' "${c}" 2>/dev/null | tail -1 || true)"
+            [ -n "${st}" ] || st=absent
+            case "${st}" in running|running/healthy) ;; *) problems=$((problems + 1)) ;; esac
+            rows+=("${c}|${st}")
+        done
+        # What the updater says: its own version, the one Crew runs, and a request that is going
+        # (16.4). The two versions differ from an install's Keep until the server replaces the
+        # updater (16.8), which never replaces itself.
+        if [ -S "${UPDATER_SOCK}" ]; then
+            st="$(updater_call GET /status | sed '$d' | python3 -I -c '
+import json, sys
+try:
+    s = json.load(sys.stdin)
+except ValueError:
+    print("does not answer"); sys.exit(0)
+c = s.get("current")
+print("is " + (s["state"].get("updater") or "?") + "; Crew runs " + (s["state"].get("running") or "?") + ("; installing " + c["version"] + " at " + c["steps"][-1]["name"] if c and c.get("steps") else ""))' 2>/dev/null || echo "does not answer")"
+        else st="no socket"; fi
+        case "${st}" in "is "*) ;; *) problems=$((problems + 1)) ;; esac
+        rows+=("updater|${st}")
+        st="$(systemctl is-active crew-firewall.timer 2>/dev/null || true)"
+        [ "${st}" = active ] || problems=$((problems + 1))
+        rows+=("crew-firewall.timer|${st:-absent}")
+        # The restart timer (16.10) is a problem only where install put it: a machine set up before it
+        # has none until install --upgrade-runtime.
+        st="$(systemctl is-active crew-restart.timer 2>/dev/null || true)"
+        if [ "${st}" != active ] && grep -q 'crew-restart.timer' "${INSTALL_JSON}" 2>/dev/null; then problems=$((problems + 1)); fi
+        rows+=("crew-restart.timer|${st:-absent}")
+        st="$(iptables -S CREW-FWD 2>/dev/null | grep -c '^-A' || true)"
+        [ "${st:-0}" -gt 0 ] || problems=$((problems + 1))
+        rows+=("CREW-FWD rules|${st:-0}")
+        st="$(iptables -S CREW-MDL 2>/dev/null | grep -c '^-A' || true)"
+        [ "${st:-0}" -gt 0 ] || problems=$((problems + 1))
+        rows+=("CREW-MDL rules|${st:-0}")
+    fi
+    if [ "${JSON}" = 1 ]; then
+        printf '%s\n' "${rows[@]}" | python3 -I -c '
+import json, sys
+installed, version, problems = sys.argv[1] == "1", sys.argv[2], int(sys.argv[3])
+parts = {}
+for line in sys.stdin.read().splitlines():
+    if line:
+        k, v = line.split("|", 1)
+        parts[k] = v
+print(json.dumps({"installed": installed, "version": version or None, "ok": installed and problems == 0, "parts": parts}, indent=2))' \
+            "${installed}" "${v}" "${problems}"
+    else
+        if [ "${installed}" = 0 ]; then echo "Crew is not installed on this machine"
+        else
+            echo "Crew ${v}"
+            local r; for r in "${rows[@]}"; do printf '  %-22s %s\n' "${r%%|*}" "${r#*|}"; done
+        fi
+    fi
+    [ "${installed}" = 1 ] || return 2
+    [ "${problems}" = 0 ] || return 1
+}
+
+# ─── Edit (16.11) ───────────────────────────────────────────────────────────
+cmd_edit() {
+    need_root
+    [ -f "${ENV_FILE}" ] || die "Crew is not installed"
+    [ $# -gt 0 ] || die "edit KEY=VALUE..."
+    load_answers
+    local kv k v
+    EDITED=()
+    for kv in "$@"; do
+        k="${kv%%=*}"
+        known_key "${k}" || die "${k} is not a key of the install file"
+        case "${SECRET_KEYS}" in
+            *" ${k} "*)
+                # A secret on the command line is in the process list and the shell's history.
+                [[ "${kv}" != *=* ]] || die "give ${k} without a value: crew-ctl edit ${k}, and it asks for it"
+                ask v "${k}" secret ;;
+            *)
+                [[ "${kv}" == *=* ]] || die "edit KEY=VALUE, not ${kv}"
+                v="${kv#*=}" ;;
+        esac
+        printf -v "A_${k}" '%s' "${v}"
+        EDITED+=("${k}")
+    done
+    local problems; problems="$(check_answers)"
+    [ -z "${problems}" ] || die "nothing was changed:"$'\n'"${problems}"
+    for k in "${EDITED[@]}"; do v="A_${k}"; log "${k}: $(masked "${k}" "${!v}")"; done
+    write_env
+    write_answer_secrets
+    # Compose starts again only the containers whose settings changed.
+    compose up -d crew-server crew-caddy
+    wait_healthy crew-server 60
+}
+
+# ─── Logs ───────────────────────────────────────────────────────────────────
+cmd_logs() {
+    local which="${1:-}" c
+    case "${which}" in
+        server) c=(crew-server) ;; ingress) c=(crew-caddy) ;; db) c=(crew-db) ;; updater) c=(crew-updater) ;;
+        '') c=("${CONTAINERS[@]}") ;; *) die "logs [server|ingress|db|updater] [-f]" ;;
+    esac
+    if [ "${FOLLOW}" = 1 ] && [ "${#c[@]}" = 1 ]; then docker logs -f --tail 100 "${c[0]}"; return; fi
+    for which in "${c[@]}"; do echo "── ${which}"; docker logs --tail 100 "${which}" 2>&1 || echo "(no such container)"; done
+}
+
+# ─── Uninstall (16.11) ──────────────────────────────────────────────────────
+confirm_word() {
+    local word="$1" typed=""
+    if [ -n "${CONFIRM_GIVEN}" ]; then
+        [ "${CONFIRM_GIVEN}" = "${word}" ] || die "--confirm ${CONFIRM_GIVEN} is not the word this level asks for; nothing was changed"
+        return 0
+    fi
+    has_tty || die "no terminal to confirm on: pass --confirm ${word}"
+    read -r -p "Type ${word} to go on: " typed < /dev/tty
+    [ "${typed}" = "${word}" ] || die "nothing was changed"
+}
+
+FAILED=0
+step() { "$@" || { FAILED=$((FAILED + 1)); warn "failed: $*"; }; }
+
+drop_chain() { # drop_chain IPTABLES PARENT CHAIN: removes the jumps, then the chain
+    local ipt="$1" parent="$2" chain="$3" rule
+    have "${ipt}" || return 0
+    "${ipt}" -w 5 -nL "${chain}" >/dev/null 2>&1 || return 0
+    while IFS= read -r rule; do
+        [ -n "${rule}" ] || continue
+        # shellcheck disable=SC2086  # the rule's own words are the arguments
+        step run "${ipt}" -w 5 -D "${parent}" ${rule}
+    done < <("${ipt}" -w 5 -S "${parent}" 2>/dev/null | grep -E -- "-j ${chain}\$" | sed -E "s/^-A ${parent} //" || true)
+    step run "${ipt}" -w 5 -F "${chain}"
+    step run "${ipt}" -w 5 -X "${chain}"
+}
+
+# rm_tree PATH: a recursive delete only of a directory named as Crew's own, never through a link.
+rm_tree() {
+    local p="$1" real
+    [ -e "${p}" ] || [ "${DRY}" = 1 ] || return 0
+    real="$(realpath -m -- "${p}")"
+    [ "${real}" = "${p}" ] || { FAILED=$((FAILED + 1)); warn "not deleting ${p}: a link or .. in the path"; return; }
+    case "${p}" in
+        /|/etc|/usr|/var|/var/lib|/home|/root|/opt|/usr/local|/usr/local/lib) FAILED=$((FAILED + 1)); warn "not deleting ${p}"; return ;;
+    esac
+    [ "${p}" = "${A_CREW_DATA_DIR:-/var/lib/crew}" ] || [ "${p}" = "${ETC_DIR}" ] || [ "${p}" = "${LIB_DIR}" ] \
+        || { FAILED=$((FAILED + 1)); warn "not deleting ${p}: not one of Crew's folders"; return; }
+    step run rm -rf -- "${p}"
+}
+
+uninstall_plan() {
+    local level="$1"
+    echo "Level ${level} of uninstall will:"
+    case "${level}" in
+        1) echo "  stop crew-caddy, crew-server, crew-updater, crew-db, and every sandbox, and switch the firewall's units"
+           echo "  and the restart timer off"
+           echo "  keep everything" ;;
+        2|3) echo "  remove the services, every sandbox and its network, the firewall's rules and units, the"
+             echo "  restart timer, Crew's settings of the security updates, the images of Crew, and ${LIB_DIR}" ;;
+    esac
+    case "${level}" in
+        2) echo "  keep ${A_CREW_DATA_DIR} with the database and the backups, ${ETC_DIR}, crew-ctl, Docker, and Kata" ;;
+        3) echo "  then delete ${A_CREW_DATA_DIR} with the database and the backups, ${ETC_DIR}, the user crew,"
+           echo "  and crew-ctl. This cannot be undone."
+           if [ "${WITH_RUNTIME}" = 1 ]; then echo "  and, where install put them in, Docker, Kata, and Crew's lines in daemon.json"
+           else echo "  keep Docker and Kata"; fi ;;
+    esac
+    echo "Not on this machine, so not touched: the repositories and the GitHub App on GitHub, the"
+    echo "sign-in client at Google, and the DNS records."
+}
+
+sandboxes() { docker ps -aq --filter label=crew.sandbox 2>/dev/null || true; }
+
+cmd_uninstall() {
+    need_root
+    ctl_lock
+    case "${LEVEL}" in 1|2|3) ;; *) die "uninstall --level 1, 2, or 3" ;; esac
+    [ -f "${ENV_FILE}" ] || [ -f "${INSTALL_JSON}" ] || die "Crew is not installed"
+    load_answers
+    # The data folder is the one install recorded, whatever the install file says now.
+    local recorded
+    recorded="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("data_dir",""))' "${INSTALL_JSON}" 2>/dev/null || true)"
+    [ -z "${recorded}" ] || A_CREW_DATA_DIR="${recorded}"
+    uninstall_plan "${LEVEL}"
+    local word
+    case "${LEVEL}" in 1) word=stop ;; 2) word=uninstall ;; 3) word="$(hostname -s)" ;; esac
+    [ "${DRY}" = 1 ] || confirm_word "${word}"
+    local ids u
+    ids="$(sandboxes)"
+    if [ "${LEVEL}" = 1 ]; then
+        if [ -f "${LIB_DIR}/compose.yaml" ]; then step compose stop; else step run docker stop "${CONTAINERS[@]}"; fi
+        # shellcheck disable=SC2086
+        [ -z "${ids}" ] || step run docker stop ${ids}
+        for u in "${UNITS[@]}"; do step run systemctl disable --now "${u}"; done
+        log "Crew is stopped; crew-ctl install --build starts it again"
+        return
+    fi
+    # Level 2, and the first half of level 3.
+    if [ -f "${LIB_DIR}/compose.yaml" ]; then step compose down --remove-orphans
+    else step run docker rm -f "${CONTAINERS[@]}"; step run docker network rm crew-db crew-ingress crew-out; fi
+    # shellcheck disable=SC2086
+    [ -z "${ids}" ] || step run docker rm -f ${ids}
+    while IFS= read -r u; do [ -n "${u}" ] && step run docker network rm "${u}"; done \
+        < <(docker network ls --format '{{.Name}}' 2>/dev/null | grep -E '^(sdb|mdl|src|lan|app|apo)-' || true)
+    for u in "${UNITS[@]}"; do step run systemctl disable --now "${u}"; step run rm -f "${UNIT_DIR}/${u}"; done
+    # Crew's own small files beside Docker: its place when memory runs out, and KSM (13.1); and the
+    # settings of the security updates (16.10), so the machine is back to its distro's own.
+    step run rm -f /etc/systemd/system/docker.service.d/50-crew-oom.conf /etc/tmpfiles.d/crew-ksm.conf "${APT_FILES[@]}"
+    step run systemctl daemon-reload
+    step run rm -f /usr/local/sbin/crew-firewall.sh
+    drop_chain iptables INPUT CREW-IN
+    drop_chain iptables DOCKER-USER CREW-FWD
+    drop_chain iptables DOCKER-USER CREW-MDL
+    drop_chain iptables DOCKER-USER CREW-APP
+    drop_chain iptables DOCKER-USER CREW-APO
+    drop_chain ip6tables INPUT CREW-IN6
+    drop_chain ip6tables FORWARD CREW-FWD6
+    while IFS= read -r u; do [ -n "${u}" ] && step run docker image rm "${u}"; done \
+        < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '^crew-(server|caddy|runtime|updater):' || true)
+    rm_tree "${LIB_DIR}"
+    # The updater's socket, which Docker made the folder of, and its lock beside it (16.11, since 0.53).
+    step run rm -f "${UPDATER_SOCK}"
+    step run rm -f "$(dirname "${UPDATER_SOCK}")/updater.lock"
+    step run rmdir --ignore-fail-on-non-empty "$(dirname "${UPDATER_SOCK}")"
+    if [ "${LEVEL}" = 3 ]; then
+        local machine; machine="$(python3 -I -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("machine",{})))' "${INSTALL_JSON}" 2>/dev/null || echo '{}')"
+        rm_tree "${A_CREW_DATA_DIR}"
+        if [ "${WITH_RUNTIME}" = 1 ]; then uninstall_runtime "${machine}"; fi
+        # /etc/crew last, after install.json was read.
+        rm_tree "${ETC_DIR}"
+        if [ "${DRY}" = 1 ] || id crew >/dev/null 2>&1; then step run userdel crew; fi
+        step run rm -f "${SBIN_DIR}/crew-ctl"
+    fi
+    if [ "${FAILED}" -gt 0 ]; then die "${FAILED} step(s) failed: see the warnings above"; fi
+    log "uninstall level ${LEVEL} is done"
+}
+
+uninstall_runtime() { # takes out what install.json says Crew installed, and nothing else
+    local machine="$1"
+    local docker kata
+    docker="$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1]).get("docker",""))' "${machine}")"
+    kata="$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1]).get("kata",""))' "${machine}")"
+    # Every folder of Kata that Crew unpacked (/opt/kata-<version>), and 3.31's /opt/kata with its shim
+    # wrapper when Crew installed it: names of Kata's shape only, one by one, never through a symlink.
+    local d legacy=0
+    while IFS= read -r -d '' d; do
+        if [ -L "${d}" ]; then warn "a symlink, not a folder of Kata, left: ${d}"; continue; fi
+        step run rm -rf "${d}"
+        # What a host setup that was stopped left beside it: a half unpack, a folder renamed for removal.
+        for x in "${d}.removing" "${d}".unpack.*; do
+            if [ -e "${x}" ] && [ ! -L "${x}" ]; then step run rm -rf "${x}"; fi
+        done
+        [ "${d}" = /opt/kata ] && legacy=1
+    done < <(python3 -I -c 'import json,re,sys
+m = json.loads(sys.argv[1])
+ds = list(m.get("kata_dirs", []))
+if m.get("kata", "").startswith("installed 3.") and "/opt/kata" not in ds and "/opt/kata" not in m.get("kata_dirs_gone", []):
+    ds.append("/opt/kata")
+for d in ds:
+    if isinstance(d, str) and re.fullmatch(r"/opt/kata(-[0-9][0-9A-Za-z.+~-]*)?", d) and ".." not in d:
+        sys.stdout.write(d + "\0")
+    else:
+        sys.stderr.write("==> WARNING: not a folder of Kata, left: %r\n" % (d,))' "${machine}")
+    if [ "${legacy}" = 1 ]; then step run rm -f /usr/local/bin/containerd-shim-mvm-v2; fi
+    if [ "${DRY}" = 1 ]; then echo "+ put back the keys of daemon.json that Crew changed"
+    else
+        python3 -I - "${machine}" <<'PY' || FAILED=$((FAILED + 1))
+import json, os, sys, tempfile
+machine = json.loads(sys.argv[1])
+path = "/etc/docker/daemon.json"
+old = machine.get("daemon_json", {})
+if old.get("__file__") == "<absent>" and os.path.exists(path):
+    os.remove(path)
+    try:
+        os.rmdir(os.path.dirname(path))
+    except OSError:
+        pass
+elif old and os.path.exists(path):
+    cfg = json.load(open(path))
+    for k, v in old.items():
+        if v == "<absent>":
+            cfg.pop(k, None)
+        else:
+            cfg[k] = v
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=4, sort_keys=True)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+PY
+    fi
+    local f
+    for f in $(python3 -I -c 'import json,sys; m=json.loads(sys.argv[1]); print(" ".join(m.get("units",[]) + m.get("kernel_settings",[]) + [x for x in m.get("files",[]) if x.startswith("/etc/apt/")]))' "${machine}"); do
+        step run rm -f "${f}"
+    done
+    if [[ "${docker}" == installed* ]]; then
+        step run apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        step run rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.asc
+    elif [[ "${kata}" == installed* ]]; then
+        step run systemctl restart docker
+    fi
+    # The packages the host setup added, last: this script needs python3 up to here.
+    local pkgs
+    pkgs="$(python3 -I -c 'import json,sys; print(" ".join(json.loads(sys.argv[1]).get("packages",[])))' "${machine}")"
+    # shellcheck disable=SC2086
+    [ -z "${pkgs}" ] || step run apt-get purge -y ${pkgs}
+}
+
+# ─── What crew-ctl passes on to crew admin ──────────────────────────────────
+cmd_passthrough() {
+    need_root
+    [ -f "${ENV_FILE}" ] || die "Crew is not installed"
+    case "$1" in
+        migrate|backup|proof|pause|resume) admin "$1" ;;
+        restore)
+            [ $# = 2 ] || die "restore FILE"
+            local f; f="$(realpath -- "$2")"
+            [ -f "${f}" ] || die "no such file: $2"
+            local dir; dir="$(env_get "${ENV_FILE}" CREW_DATA_DIR)"; dir="${dir:-/var/lib/crew}"
+            [[ "${f}" == "${dir}/"* ]] || die "the backup must be in ${dir}, which crew admin sees"
+            confirm_word restore
+            # The server is stopped for it, so no request writes between the backup's state and its
+            # own (16.9); it starts again whether the restore worked or not.
+            run docker stop --time 20 crew-server
+            local rc=0; admin restore "${f}" || rc=$?
+            compose up -d --no-deps crew-server
+            wait_healthy crew-server 120
+            [ "${rc}" = 0 ] || die "the restore failed and changed nothing; the server runs on the database as it was" ;;
+        settings)
+            case "${2:-}" in
+                export) admin settings export ;;
+                import) [ $# = 3 ] || die "settings import FILE"; [ -r "$3" ] || die "cannot read $3"
+                        compose run --rm -T crew-admin admin settings import - < "$3" ;;
+                *) die "settings export | settings import FILE" ;;
+            esac ;;
+        db)
+            [ "${2:-}" = shell ] || die "db shell"
+            local args=(exec -it); has_tty || args=(exec -i)
+            docker "${args[@]}" crew-db \
+                sh -c 'PGPASSWORD="$(cat /run/secrets/db_crew_read)" exec psql -h 127.0.0.1 -U crew_read -d crew' ;;
+    esac
+}
+
+# ─── The restart for security updates (16.10) ──────────────────────────────
+# crew-restart.timer runs it every 15 minutes. It reads whether the machine needs a restart and asks
+# the server, through Docker on the machine (20.3's two doors), which records it, says whether it is
+# quiet, and writes the news before its yes. Only exit 0 of the server is a yes: the server down, the
+# database that cannot be written, or any error of Docker's is no restart. A no is no failure of the
+# timer's unit; a restart that fails is.
+cmd_restart_if_quiet() {
+    need_root
+    [ -f "${ENV_FILE}" ] || { log "Crew is not installed: nothing to ask"; return 0; }
+    # Without flock the lock cannot keep a restart out of an install: the unit fails, so it shows.
+    [ "${DRY}" = 1 ] || have flock || die "flock is missing, so crew-ctl's lock cannot be taken: no restart is asked for"
+    if ! ctl_lock nowait; then
+        # A lock held for more than two hours is no install that runs: the unit fails, so it shows.
+        if [ -n "$(find "${CTL_LOCK}" -mmin +120 2>/dev/null)" ]; then
+            die "${CTL_LOCK} has been held for more than two hours: no restart is asked for (fuser -v ${CTL_LOCK})"
+        fi
+        log "an install or an uninstall runs: no restart now"; return 0
+    fi
+    local req=no out rc=0 seen="${CTL_LOCK%/*}/crew-restart-wanted"
+    [ -e "${REBOOT_REQUIRED}" ] && req=yes
+    # When a restart was first seen wanted, in /run beside the lock: the file the updates write is
+    # written again by each that asks for a restart, so its time says nothing of how long it waited.
+    [ ! -L "${seen}" ] || die "${seen} is a link"
+    if [ "${req}" = yes ]; then [ -e "${seen}" ] || touch -- "${seen}"; else rm -f -- "${seen}"; fi
+    if [ "${req}" = yes ]; then
+        local pkgs; pkgs="$(tr '\n' ' ' < "${REBOOT_REQUIRED}.pkgs" 2>/dev/null | sed 's/ $//' || true)"
+        log "the machine needs a restart for security updates${pkgs:+: ${pkgs}}"
+    fi
+    out="$(docker exec crew-server crew admin restart-check --reboot-required="${req}" 2>&1)" || rc=$?
+    # The server's words, without control characters but the line ends, C1's too.
+    [ -z "${out}" ] || printf '%s\n' "${out}" | tr -d '\000-\011\013-\037\177' | LC_ALL=C sed 's/\xc2[\x80-\x9f]//g' | tail -c 2000
+    if [ "${req}" = yes ] && [ "${rc}" != 0 ] && [ -n "$(find "${seen}" -mmin +$((RESTART_DAYS * 24 * 60)) 2>/dev/null)" ]; then
+        # The server's no, or no answer, for longer than the 7 days it waits for quiet hours: its own
+        # record of the wait may be gone with an error, so the unit fails, and it shows.
+        die "the machine has needed a restart for security updates for more than ${RESTART_DAYS} days (since $(date -r "${seen}" '+%F %R')), and Crew's server did not say yes"
+    fi
+    if [ "${req}" != yes ] || [ "${rc}" != 0 ]; then return 0; fi
+    log "restarting the machine"
+    run systemctl reboot || die "systemctl reboot failed"
+}
+
+# ─── Projects: written out as a folder, and read back (design 6.2) ──────────
+# The server's container has the repositories, so crew admin runs there; the folder is on the
+# machine, and travels to and from it as a tar stream.
+cmd_project() {
+    need_root
+    [ -f "${ENV_FILE}" ] || die "Crew is not installed"
+    case "${1:-}" in
+        ls) [ $# = 1 ] || die "project ls"
+            docker exec crew-server crew admin project ls ;;
+        export)
+            [ $# = 3 ] || die "project export NAME DIR"
+            local name="$2" dir="$3"
+            [[ "${name}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "${name} is not a project's name"
+            [ -L "${dir}" ] && die "${dir} is a link"
+            if [ -e "${dir}" ]; then
+                [ -d "${dir}" ] && [ -z "$(ls -A -- "${dir}" 2>/dev/null)" ] || die "${dir} is not an empty folder"
+                # Root writes the export: into a folder of root's, or of whoever ran sudo, only.
+                local owner; owner="$(stat -c %u -- "${dir}")"
+                [ "${owner}" = 0 ] || [ "${owner}" = "${SUDO_UID:-0}" ] || [ "${owner}" = "$(id -u)" ] \
+                    || die "${dir} belongs to another user"
+            fi
+            [ "${DRY}" = 1 ] && { echo "would write ${name} into ${dir}"; return 0; }
+            # It is unpacked into a new folder of its own beside DIR, which no one else can reach while
+            # it is written, and then moved into place.
+            local parent tmp pown pmode; parent="$(dirname -- "${dir}")"
+            mkdir -p -- "${parent}"
+            # The new folder is made in DIR's parent, so no one else may replace it there: the parent
+            # belongs to root, to whoever ran sudo, or to the caller, and if others may write to it, it
+            # is sticky, as /tmp is.
+            pown="$(stat -c %u -- "${parent}")"; pmode="$(stat -c %a -- "${parent}")"
+            [ "${pown}" = 0 ] || [ "${pown}" = "${SUDO_UID:-0}" ] || [ "${pown}" = "$(id -u)" ] \
+                || die "${parent} belongs to another user"
+            if (( (8#${pmode} & 8#022) != 0 && (8#${pmode} & 8#1000) == 0 )); then
+                die "others may write to ${parent}, and it is not sticky"
+            fi
+            tmp="$(mktemp -d -p "${parent}" .crew-export.XXXXXX)"
+            if ! docker exec crew-server crew admin project export "${name}" | tar -x -C "${tmp}" --no-same-owner --no-same-permissions; then
+                rm -rf -- "${tmp}"
+                die "the export of ${name} failed; nothing was written to ${dir}"
+            fi
+            chmod 0700 -- "${tmp}"
+            [ -d "${dir}" ] && rmdir -- "${dir}"
+            mv -T -- "${tmp}" "${dir}"
+            echo "${name} is written out to ${dir}" ;;
+        import)
+            [ $# = 2 ] || die "project import DIR [--name NAME] [--key KEY]"
+            local dir="$2" extra=()
+            [ -f "${dir}/project.md" ] || die "${dir} holds no project.md: not an export"
+            [ -n "${PROJECT_NAME}" ] && extra+=(--name "${PROJECT_NAME}")
+            [ -n "${PROJECT_KEY}" ] && extra+=(--key "${PROJECT_KEY}")
+            [ "${DRY}" = 1 ] && { echo "would import ${dir} ${extra[*]}"; return 0; }
+            tar -c -C "${dir}" . | docker exec -i crew-server crew admin project import - "${extra[@]}" ;;
+        *) die "project ls | project export NAME DIR | project import DIR [--name NAME] [--key KEY]" ;;
+    esac
+}
+
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+    local verb="" args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) DRY=1 ;;
+            --yes) YES=1 ;;
+            --json) JSON=1 ;;
+            --confirm) CONFIRM_GIVEN="${2:?--confirm WORD}"; shift ;;
+            --env-file) ENV_IN="${2:?--env-file FILE}"; shift ;;
+            --build) BUILD=1 ;;
+            --upgrade-runtime) UPGRADE=1 ;;
+            --deploy-files) DEPLOY_FILES=1 ;;
+            --from) FROM_DIR="$(realpath -m -- "${2:?--from FOLDER}")"; shift ;;
+            --registry) REGISTRY="${2:?--registry HOST/PATH}"; shift ;;
+            --registry-token-file) REG_TOKEN_ARG="${2:?--registry-token-file FILE}"; REG_TOKEN_FILE="$(realpath -m -- "$2")"; shift ;;
+            --out) OUT_DIR="${2:?--out DIR}"; shift ;;
+            --version) VERSION_ARG="${2:?--version X.Y.Z}"; shift ;;
+            --title) TITLE_ARG="${2?--title TEXT}"; shift ;;
+            --level) LEVEL="${2:?--level N}"; shift ;;
+            --with-runtime) WITH_RUNTIME=1 ;;
+            -f|--follow) FOLLOW=1 ;;
+            --name) PROJECT_NAME="${2:?--name NAME}"; shift ;;
+            --key) PROJECT_KEY="${2:?--key KEY}"; shift ;;
+            -h|--help|help) usage; return 0 ;;
+            -*) die "unknown flag $1" ;;
+            *) if [ -z "${verb}" ]; then verb="$1"; else args+=("$1"); fi ;;
+        esac
+        shift
+    done
+    # crew-ctl and its files are root's, and an update does not replace them: every run says when they
+    # are not the running release's (16.11, since 0.55).
+    case "${verb}" in ''|install|uninstall|restart-if-quiet) ;; *) deploy_files_behind ;; esac
+    case "${verb}" in
+        doctor) cmd_doctor ;;
+        install) cmd_install ;;
+        build) cmd_build ;;
+        gate) cmd_gate "${args[@]}" ;;
+        update) cmd_update ;;
+        rollback) cmd_rollback ;;
+        status) cmd_status ;;
+        edit) cmd_edit "${args[@]}" ;;
+        logs) cmd_logs "${args[@]}" ;;
+        uninstall) cmd_uninstall ;;
+        proof) cmd_proof ;;
+        migrate|backup|restore|settings|db|pause|resume) cmd_passthrough "${verb}" "${args[@]}" ;;
+        selftest) cmd_selftest ;;
+        restart-if-quiet) cmd_restart_if_quiet ;;
+        project) cmd_project "${args[@]}" ;;
+        release) cmd_release "${args[@]}" ;;
+        '') usage; return 2 ;;
+        *) die "unknown verb ${verb} (crew-ctl help)" ;;
+    esac
+}
+
+# Sourced by the tests, it defines the functions and runs nothing.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

@@ -1,0 +1,9 @@
+{
+ "name": "chrome-devtools-mcp",
+ "version": "1.11.0",
+ "dist": {
+  "integrity": "sha512-CytJ/5tnzrS+J/74be2P5aCOsS/mmGRHys/Si+IYC4ucrbnWAmES/dYdxGJjeUCECRcoFUilZAysdjlwqUjXIA==",
+  "shasum": "c370697cced824e867be0005e39b4bd9e62e32d2",
+  "tarball": "https://registry.npmjs.org/chrome-devtools-mcp/-/chrome-devtools-mcp-1.11.0.tgz"
+ }
+}

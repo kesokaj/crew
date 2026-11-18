@@ -1,0 +1,11 @@
+-- Design 1.01. A run keeps the step of crew-run's own that its last turn's exit.json named, when the
+-- server took it: one on the list, with the reason error (13.9). An eval reads it to tell a run whose
+-- workspace crew-run could not make, in place of its end detail's beginning, which an end without a
+-- step gives in its own words. The step is still exit.json's word, which the sandbox writes.
+-- older versions read: yes
+--
+-- An older version does not read the column, and reads the detail's beginning as before. The runs
+-- stored before this step keep none, since no step rewrites them: an eval that is going on across the
+-- update reads such a run as the agent's end. Ended evals are not read again; dave held no eval going
+-- on when 1.01 was made.
+ALTER TABLE runs ADD COLUMN end_step text;

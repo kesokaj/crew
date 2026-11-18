@@ -1,0 +1,17 @@
+# What each agent runs on, as CLI/model in order, and its effort (design 12.3, the table "The
+# defaults"). agy is the only CLI since 0.42. Install seeds the machine's settings, agents.roles, from
+# this file; when models are recorded or on startup, Crew syncs automatic roles by (family, bracket)
+# and version/first_seen order while preserving Set by you, operator edits, operator removals, and
+# active Chooser decisions.
+curator:   {model: [agy/gemini-4-carbon, agy/gemini-4-argon, agy/gemini-3.8-flash], effort: high}
+planner:   {model: [agy/gemini-4-carbon, agy/gemini-4-argon, agy/gemini-3.8-flash], effort: high}
+assistant: {model: [agy/gemini-4-carbon, agy/gemini-4-argon, agy/gemini-3.8-flash], effort: high}
+builder:   {model: [agy/gemini-4-carbon, agy/gemini-4-argon, agy/gemini-3.8-flash], effort: high}
+reviewer:  {model: [agy/claude-opus-5-5, agy/gemini-4-carbon, agy/gemini-4-argon, agy/claude-sonnet-5-5, agy/gemini-3.8-flash], effort: high}
+tester:    {model: [agy/gemini-3.8-flash, agy/gemini-4-carbon, agy/gemini-4-argon], effort: medium}
+e2e:       {model: [agy/gemini-3.8-flash, agy/gemini-4-carbon, agy/gemini-4-argon], effort: medium}
+verifier:  {model: [agy/claude-opus-5-5, agy/gemini-4-carbon, agy/gemini-4-argon, agy/gemini-3.8-flash], effort: high}
+summary:   {model: [agy/gemini-3.8-flash, agy/gemini-4-carbon, agy/gemini-4-argon], effort: low}
+prompt:    {model: [agy/gemini-3.8-flash, agy/gemini-4-carbon, agy/gemini-4-argon], effort: medium}
+judge:     {model: [agy/claude-sonnet-5-5, agy/gemini-3.8-flash, agy/gemini-4-carbon, agy/gemini-4-argon], effort: low}
+improver:  {model: [agy/gemini-4-carbon, agy/gemini-4-argon, agy/gemini-3.8-flash], effort: high}

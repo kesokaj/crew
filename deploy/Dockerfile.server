@@ -1,0 +1,97 @@
+# The server's image: crew serve, crew admin, the built UI, and the PostgreSQL tools of the database's
+# own image, so that a dump is made by the same version that runs the database (design 15.3). The
+# stage updater is the updater's image (16.4): crew-updater with Docker's command line and Compose,
+# built with --target updater.
+# Build context: the repository's root. Every image is pinned; the defaults below are the values of
+# versions.lock, and make check compares them with it. A build takes nothing from the machine.
+ARG GO_IMAGE=golang:1.27.4-trixie@sha256:f18c3d73a184fb0582828510722e723b63a93f7188d11dd223d9be6f6880e65d
+ARG SERVER_BASE_IMAGE=debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+ARG WEB_NODE_IMAGE=node:22.23.4-trixie-slim@sha256:be1e2a3dc2c4fd68cdfadad2a696a280e0d2749098bee509230174d72fb768c6
+ARG POSTGRES_IMAGE=postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+
+FROM ${WEB_NODE_IMAGE} AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+# npm ci installs exactly the lock file, and fails when it does not match package.json.
+RUN npm ci --no-audit --no-fund --no-update-notifier
+COPY web/ ./
+RUN npm run build
+
+FROM ${GO_IMAGE} AS build
+# In a Sources sandbox Go's modules come through the server's module proxy, which release.sh passes
+# as a build argument; with none, it is empty and Go's command takes its default (13.6).
+ARG GOPROXY
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ cmd/
+COPY internal/ internal/
+COPY baseline/ baseline/
+# The base layer's names and descriptions, for list_skills and the Settings screen (12.9).
+COPY harness/ harness/
+# The improver's own definition, embedded by the module's root package (10.3).
+COPY improver.go improver.md ./
+ARG CREW_VERSION=0.0.0-dev
+RUN CGO_ENABLED=0 GOFLAGS=-mod=readonly go build -trimpath \
+    -ldflags "-s -w -X github.com/kesokaj/crew/internal/version.Version=${CREW_VERSION}" \
+    -o /out/ ./cmd/crew ./cmd/crew-updater
+
+# The updater: Docker's command line and Compose from Docker's package source at the versions
+# versions.lock names, which that source keeps; nothing else of Crew.
+FROM ${SERVER_BASE_IMAGE} AS updater
+ARG RUNTIME_DOCKER_CE_VERSION=5:29.9.0-1~debian.13~trixie
+ARG RUNTIME_COMPOSE_VERSION=5.6.0-1~debian.13~trixie
+# The updater runs as root with the Docker socket: the key that signs Docker's packages is taken only
+# with the fingerprint versions.lock names.
+ARG DOCKER_APT_KEY_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+# A release's build reads its package sources through a proxy that takes only HTTPS (16.2 step 4):
+# Debian's sources move to HTTPS, with the CA bundle of the pinned Go image, before apt runs.
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && ! grep -q '^URIs:.*http://' /etc/apt/sources.list.d/debian.sources \
+    && echo 'Acquire::https::CAInfo "/etc/ssl/certs/ca-certificates.crt";' > /etc/apt/apt.conf.d/99crew-https
+RUN apt-get update && apt-get install --no-install-recommends -y ca-certificates curl gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && test "$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc \
+       | awk -F: '$1 == "pub" {n++; want = 1} $1 == "fpr" && want {f = $10; want = 0} END {print n ":" f}')" \
+       = "1:${DOCKER_APT_KEY_FINGERPRINT}" \
+    && echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian trixie stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install --no-install-recommends -y \
+       "docker-ce-cli=${RUNTIME_DOCKER_CE_VERSION}" "docker-compose-plugin=${RUNTIME_COMPOSE_VERSION}" \
+    && apt-get purge -y curl gnupg && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* /root/.gnupg \
+    && docker compose version
+COPY --from=build /out/crew-updater /usr/local/bin/crew-updater
+ENTRYPOINT ["/usr/local/bin/crew-updater"]
+ARG CREW_VERSION=0.0.0-dev
+LABEL crew.version="${CREW_VERSION}"
+
+FROM ${POSTGRES_IMAGE} AS postgres
+
+FROM ${SERVER_BASE_IMAGE}
+# A release's build reads its package sources through a proxy that takes only HTTPS (16.2 step 4):
+# Debian's sources move to HTTPS, with the CA bundle of the pinned Go image, before apt runs.
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && ! grep -q '^URIs:.*http://' /etc/apt/sources.list.d/debian.sources \
+    && echo 'Acquire::https::CAInfo "/etc/ssl/certs/ca-certificates.crt";' > /etc/apt/apt.conf.d/99crew-https
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates tzdata git openssh-client libnss-wrapper \
+       libgssapi-krb5-2 libldap2 liblz4-1 libzstd1 libreadline8t64 libxxhash0 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=postgres /usr/lib/x86_64-linux-gnu/libpq.so.5* /usr/lib/x86_64-linux-gnu/
+COPY --from=postgres /usr/lib/postgresql/18/bin/pg_dump /usr/lib/postgresql/18/bin/psql /usr/local/bin/
+RUN ! ldd /usr/local/bin/pg_dump /usr/local/bin/psql | grep 'not found' && pg_dump --version
+# ssh with an entry in passwd for the uid the server runs as (internal/github): with the library
+# preloaded, a uid that /etc/passwd lacks is found in the file it is given. Without the library the
+# preload is only warned about, and getent finds nothing, so the build fails.
+RUN printf 'crewcheck:x:4242:4242::/nonexistent:/bin/false\n' > /tmp/p && printf 'crewcheck:x:4242:\n' > /tmp/g \
+    && LD_PRELOAD=libnss_wrapper.so NSS_WRAPPER_PASSWD=/tmp/p NSS_WRAPPER_GROUP=/tmp/g getent passwd 4242 | grep -q '^crewcheck:' \
+    && ! getent passwd 4242 && rm /tmp/p /tmp/g
+COPY --from=build /out/crew /usr/local/bin/crew
+COPY --from=web /web/dist/client /usr/share/crew/web
+HEALTHCHECK --interval=15s --timeout=6s --retries=3 CMD ["/usr/local/bin/crew", "health"]
+ENTRYPOINT ["/usr/local/bin/crew"]
+CMD ["serve"]
+ARG CREW_VERSION=0.0.0-dev
+LABEL crew.version="${CREW_VERSION}"

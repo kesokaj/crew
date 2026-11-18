@@ -1,0 +1,40 @@
+# local answers and secrets never belong in the repository
+.env
+.env.*
+*.env
+!.env.example
+crew.env
+secret.key
+secrets/
+
+# build output; a go build in the root names its program after the command
+/bin/
+/crew
+/crew-run
+/crew-harnessbuild
+/dist/
+/release/
+node_modules/
+web/dist/
+
+# raw recordings of the spike, before the scrub script
+spike/raw/
+
+# editors and systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# python
+__pycache__/
+.check/
+
+# Claude Code's own folder on this machine: settings and worktrees of agent sessions
+.claude/
+
+# the install test's bundle, logs, and console output
+.install-test/
+
+# Scratch of agents and reviews: never committed
+.agents/scratch/

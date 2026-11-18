@@ -1,0 +1,17 @@
+{
+  "classic.tar": {
+    "about": "docker save on Docker 29.7.2's classic overlay2 store of a one-file scratch image built there",
+    "config": "sha256:3470e023120a4ab9f26de8e0b4cca08435feefc051b605a5eff309d326b3f148",
+    "loaded": {"classic": "sha256:3470e023120a4ab9f26de8e0b4cca08435feefc051b605a5eff309d326b3f148", "containerd": "sha256:89e7128d42735690841b485e5d82270e6db1010390db2c3238d7af8e62a90bab"}
+  },
+  "containerd-resaved.tar": {
+    "about": "classic.tar loaded into a fresh Docker 29.7.2, whose store is containerd's, and saved again there",
+    "config": "sha256:3470e023120a4ab9f26de8e0b4cca08435feefc051b605a5eff309d326b3f148",
+    "loaded": {"classic": "sha256:3470e023120a4ab9f26de8e0b4cca08435feefc051b605a5eff309d326b3f148", "containerd": "sha256:89e7128d42735690841b485e5d82270e6db1010390db2c3238d7af8e62a90bab"}
+  },
+  "containerd-built.tar": {
+    "about": "the same Dockerfile built with buildx on the containerd store, which adds a provenance attestation: an index of the image and its attestation",
+    "config": "sha256:9f7fd7f4d9a4dafe018345ba9cfd8868197f4d1d15cec370e8e294f696419496",
+    "loaded": {"classic": "sha256:9f7fd7f4d9a4dafe018345ba9cfd8868197f4d1d15cec370e8e294f696419496", "containerd": "sha256:564491266a39cf42fd4651931e0f790cebfd0f50df22a6552c17f20da32c914b"}
+  }
+}

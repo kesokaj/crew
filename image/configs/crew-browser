@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+# crew-browser — ONE headless Chromium per project microVM.
+#
+# Runs as the project user. The operator drives it from the SPA's Browser
+# view (a CDP screencast relayed by the crew server); the agents drive the
+# SAME browser through chrome-devtools-mcp (the `mcp` verb, registered with
+# agy at harness seeding). Chromium's DevTools listener binds
+# LOOPBACK ONLY (new-headless ignores --remote-debugging-address, verified
+# 2026-09-11), on CHROME_PORT — that is what in-guest clients (the MCP verb)
+# use. For the crew server, which reaches the guest over the project
+# bridge, a socat forwarder (its own process group) publishes it as :9222 —
+# and admits ONE peer address: the server's own address on this bridge,
+# which the server passes as CREW_BROWSER_PEER on every `start` (falling
+# back to the credential broker's host from CREW_CRED_BROKER, the same
+# address in a containerized deploy). No peer, no forwarder: the browser
+# stays loopback-only and the Browser pane cannot connect — it fails closed
+# rather than guessing. A container the user
+# runs inside this project's dockerd can reach the guest's bridge IP but is
+# refused by socat's `range=` — a DevTools client reads file:// inside the
+# guest, i.e. the brokered credentials, and an image the user merely runs
+# must not gain that. KNOWN BOUNDARY: a container run with --network=host
+# shares the guest's network namespace and reaches Chromium's loopback
+# listener directly; that is the project user's own choice inside their own
+# VM, documented in runtime-image.md, not something this launcher can
+# refuse (a pipe transport would; follow-up in the plan). The server never
+# lists, proxies or shares the port.
+#
+#   crew-browser start    idempotent; 0 once /json/version answers (≤ 15 s), else 1 + the log tail
+#   crew-browser stop     kills the process group; 0 even when nothing runs
+#   crew-browser status   {"running":true,"version":"Chrome/…"} | {"running":false}
+#   crew-browser mcp      start (quiet), then exec chrome-devtools-mcp on this browser (stdio, loopback)
+#
+# Why no --remote-allow-origins: Chromium's DevTools server refuses a
+# WebSocket upgrade whose Origin header is not on its allowlist, and the
+# allowlist is empty on purpose. Our two clients — the crew server's relay
+# and chrome-devtools-mcp — send NO Origin header and are admitted; a page
+# RENDERED INSIDE this browser always sends one and is refused, which is
+# exactly the takeover (file:// reads, cookies, every tab) the flag would
+# have allowed.
+#
+# Why no --no-sandbox: probed 2026-09-11 inside a real Kata mvm guest
+# (kernel 6.18, user namespaces on) — Chromium's own sandbox works there. If a
+# future image or kernel breaks it, `start` fails LOUDLY (the log tail reaches
+# the pane) rather than silently weakening the sandbox.
+set -euo pipefail
+
+PORT=9222        # the crew server's door: socat, bridge address, one allowed peer
+CHROME_PORT=9229 # Chromium's own loopback-only DevTools listener: in-guest clients
+HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
+DIR="${HOME}/.crew/browser"
+PROFILE="${DIR}/profile"
+PIDFILE="${DIR}/pid"
+SOCATPID="${DIR}/socat.pid"
+SOCATRANGE="${DIR}/socat.range" # the peer the running forwarder admits
+LOG="${DIR}/chromium.log"
+LOCK="${DIR}/lock"
+VERSION_URL="http://127.0.0.1:${CHROME_PORT}/json/version"
+
+# /json/version's body, or failure. Chromium refuses a Host header that is
+# not localhost or an IP literal, which 127.0.0.1 satisfies.
+probe() { curl -fsS --max-time 2 "${VERSION_URL}" 2>/dev/null; }
+version_of() { probe | jq -r '.Browser // empty' 2>/dev/null || true; }
+
+# The one source address socat admits on :9222, as "<ip>/32", or "" when
+# there is none (then no forwarder runs and the browser stays loopback-only:
+# the MCP verb still works, the Browser pane cannot connect). Only an IPv4
+# literal is accepted: the value lands inside socat's option list, where a
+# stray comma would read as more options.
+peer_range() {
+    local host="" server_run=0
+    # SET decides, not non-empty: the server always sets CREW_BROWSER_PEER
+    # on its starts — empty when it could not learn its own address — and
+    # an empty value must mean "no forwarder", not "fall back to the
+    # broker's host". Only an UNSET variable (a
+    # browser the agent's MCP server started) uses the broker fallback.
+    if [ -n "${CREW_BROWSER_PEER+set}" ]; then
+        server_run=1
+        host="${CREW_BROWSER_PEER}"
+    elif [ -n "${CREW_CRED_BROKER:-}" ]; then
+        host="${CREW_CRED_BROKER#*://}"
+        host="${host%%/*}"
+        host="${host%%:*}"
+    fi
+    # A bash regex matches the WHOLE value (grep would match any one line of
+    # a multi-line value and then emit all of it into socat's options).
+    if [[ "${host}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        printf '%s/32' "${host}"
+        return 0
+    fi
+    # Set but unusable is a server-run start whose server could not learn
+    # its own bridge address: that start must FAIL, loudly, instead of
+    # leaving a browser the pane can never reach and a generic "endpoint
+    # unreachable" later. Unset — an
+    # agent-started browser — stays loopback-only and fine.
+    [ "${server_run}" = 1 ] && return 1
+    return 0
+}
+
+# The socket inodes of the :9222 LISTEN sockets, one per line, read from
+# the kernel's own fixed-column table (/proc/net/tcp{,6}: local address in
+# hex as column 2, state 0A = LISTEN in column 4, inode in column 10). No
+# `ss` output is parsed: its `-p` line carries guest-chosen process names
+# and its `-e` line a cgroup path that may contain spaces and an `ino:`
+# look-alike.
+port_inodes() {
+    local hex f
+    hex="$(printf '%04X' "${PORT}")"
+    # Each table on its own: a host without IPv6 has no tcp6 file, and awk
+    # would fail on it after printing tcp's rows.
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "${f}" ] && awk -v p="${hex}" '$4 == "0A" && $2 ~ (":" p "$") { print $10 }' "${f}"
+    done
+    return 0
+}
+port_listening() { [ -n "$(port_inodes)" ]; }
+# owns_socket <pid> <inode>: one of the process's fds is that socket.
+owns_socket() {
+    local fd
+    for fd in "/proc/$1/fd"/*; do
+        [ "$(readlink "${fd}" 2>/dev/null || true)" = "socket:[$2]" ] && return 0
+    done
+    return 1
+}
+# comm_is <pid> <prefix>: the process's comm (first 15 bytes of its
+# executable name) starts with the prefix.
+comm_is() { case "$(cat "/proc/$1/comm" 2>/dev/null || true)" in "$2"*) return 0 ;; *) return 1 ;; esac; }
+# The forwarder THIS launcher started: the recorded pid is alive, is socat,
+# and holds the :9222 listening socket itself (the socket's inode is among
+# its fds — socat's `fork` parent keeps it). "Anything listening on :9222"
+# used to count, so the user's own app on that
+# port read as "up" and the server was pointed at it; "a live socat plus a
+# listener" still tied the two only by coincidence. Pid
+# files are guest-writable: 1–7 digits, no leading zero (a zero-padded pid
+# has no /proc entry but still resolves for pgrep/kill), before any test
+# that would print a diagnostic into the launcher's output.
+forwarder_up() {
+    local pid ino
+    pid="$(cat "${SOCATPID}" 2>/dev/null || true)"
+    [[ "${pid}" =~ ^[1-9][0-9]{0,6}$ ]] && [ -d "/proc/${pid}" ] && comm_is "${pid}" socat || return 1
+    # Inodes captured first, then matched: a pipe into a consumer that quits
+    # early ends with SIGPIPE on the producer, which pipefail would read as
+    # "not ours" and ensure_forwarder as a hard failure.
+    for ino in $(port_inodes); do
+        owns_socket "${pid}" "${ino}" && return 0
+    done
+    return 1
+}
+
+# The forwarder is its own process group with its own pid file, so it can be
+# started AFTER Chromium: a browser the agent's MCP server started (no peer in
+# its environment) gains the server's door when the pane's `start` arrives
+# with CREW_BROWSER_PEER set.
+# A failure here (no usable peer, a stranger on the port, socat not coming
+# up) leaves Chromium RUNNING: the browser itself is fine and the agents'
+# MCP session must not be torn down over the server's door. Only the launch
+# timeout in do_start takes the group down.
+ensure_forwarder() {
+    local range
+    if ! range="$(peer_range)"; then
+        echo "no usable peer address for :${PORT}: CREW_BROWSER_PEER is set but not an IPv4 address (the server could not learn its own bridge address); the browser is running, loopback-only" >&2
+        return 1
+    fi
+    if [ -z "${range}" ]; then
+        echo "no peer address for :${PORT} (CREW_BROWSER_PEER unset): browser stays loopback-only" >&2
+        return 0
+    fi
+    if forwarder_up; then
+        # Same peer as before: nothing to do. A DIFFERENT peer (the server's
+        # address on this bridge changed while Chromium lived on) means the
+        # running forwarder would refuse the server forever: replace it.
+        [ "$(cat "${SOCATRANGE}" 2>/dev/null || true)" = "${range}" ] && return 0
+        kill_group_file "${SOCATPID}" socat
+    elif port_listening; then
+        # The user's own app, or a forwarder whose pid file was lost: fail
+        # closed with the reason rather than fight for the port.
+        echo "something else listens on :${PORT} (not the forwarder this launcher started): the browser is running but the server cannot reach it" >&2
+        return 1
+    fi
+    rm -f "${SOCATRANGE}"
+    # max-children bounds socat's concurrent forwards. The server admits at
+    # most browserRelayPerUser (8, internal/httpapi/browser.go) relays per
+    # user and a project has one owner; each relay is one forward, plus one
+    # short-lived /json/version discovery per connect (Connection: close on
+    # the server side, so it never parks a child). 16 = twice the relay cap;
+    # a Go test pins the two numbers together.
+    # shellcheck disable=SC2016  # the $-expressions belong to the inner bash
+    setsid -f bash -c 'echo $$ > "$1"; exec socat "TCP-LISTEN:$2,fork,reuseaddr,bind=0.0.0.0,range=$3,max-children=16" "TCP:127.0.0.1:$4"' \
+        _ "${SOCATPID}" "${PORT}" "${range}" "${CHROME_PORT}" 9>&- >>"${LOG}" 2>&1
+    local _i
+    for _i in $(seq 1 10); do
+        if forwarder_up; then
+            # Recorded only once the listener is confirmed: a range file
+            # without a forwarder behind it would claim a door that is shut.
+            printf '%s' "${range}" > "${SOCATRANGE}"
+            return 0
+        fi
+        sleep 0.2
+    done
+    echo "forwarder did not come up on :${PORT}" >&2
+    return 1
+}
+
+# Every path below is under the guest-writable home and is created BY NAME
+# as the same uid that owns the home — no privilege boundary is crossed, so
+# a planted link here can only hurt its planter. Links are still refused,
+# because `: > LOG` through one would truncate whatever it points at (the
+# transcripts under ~/.crew/logs are what the SERVER reads back). Checked
+# BEFORE anything is created, ~/.crew included.
+refuse_links() {
+    local p
+    for p in "${HOME}/.crew" "${DIR}" "${PROFILE}" "${LOG}" "${PIDFILE}" "${SOCATPID}" "${SOCATRANGE}" "${LOCK}"; do
+        if [ -L "${p}" ]; then
+            echo "refusing to use ${p}: it is a symlink"
+            return 1
+        fi
+    done
+}
+
+launch() {
+    refuse_links || return 1
+    mkdir -p "${DIR}" "${PROFILE}"
+    chmod 700 "${DIR}"
+    # A crashed run leaves the profile's singleton lock behind; Chromium then
+    # refuses the profile and exits. Only safe when nothing answers — which
+    # the caller has just checked under the lock.
+    rm -f "${PROFILE}/SingletonLock" "${PROFILE}/SingletonSocket" "${PROFILE}/SingletonCookie" "${PIDFILE}"
+    : > "${LOG}"
+    # setsid: its own session and process group, so `stop` can kill the whole
+    # tree by group; -f forks so this script returns. The pid file holds the
+    # group leader (bash's $$ becomes chromium's pid through exec). 9>&-
+    # closes the lock descriptor in the child: inherited, chromium would hold
+    # the start lock for its whole life and the NEXT start would block on it
+    # forever (seen 2026-09-11 in the Kata probe).
+    # shellcheck disable=SC2016  # the $-expressions belong to the inner bash
+    setsid -f bash -c 'echo $$ > "$1"; \
+        exec chromium \
+        --headless=new \
+        --remote-debugging-port="$3" \
+        --user-data-dir="$2" \
+        --window-size=1280,800 \
+        --no-first-run --no-default-browser-check \
+        --disable-gpu --disable-dev-shm-usage \
+        about:blank' _ "${PIDFILE}" "${PROFILE}" "${CHROME_PORT}" 9>&- >"${LOG}" 2>&1
+}
+
+do_start() {
+    refuse_links || return 1
+    mkdir -p "${DIR}"
+    chmod 700 "${DIR}"
+    # The SPA relay and the agent's MCP server may start it at the same
+    # moment: serialize probe-then-launch.
+    exec 9>"${LOCK}"
+    # Bounded: a holder that never releases (a bug like the one above) must
+    # surface as a failure, not a hang the server's 30 s exec cap has to cut.
+    flock -w 20 9 || { echo "another start is holding ${LOCK} for over 20 s"; return 1; }
+    if probe >/dev/null; then
+        ensure_forwarder # a failure leaves the running browser alone (see there)
+        return $?
+    fi
+    launch
+    for _ in $(seq 1 30); do
+        sleep 0.5
+        if probe >/dev/null; then
+            ensure_forwarder
+            return $?
+        fi
+    done
+    echo "chromium did not answer on :${CHROME_PORT} within 15 s; last log lines:"
+    # dbus is absent in the guest by design; its errors are noise.
+    grep -v dbus "${LOG}" | tail -20 || true
+    # A failed launch can leave orphaned renderer/zygote children behind
+    # (seen when the sandbox is refused): take the whole group down.
+    do_stop
+    return 1
+}
+
+# kill_group_file <pidfile> <comm-prefix>: take down the process group whose
+# leader the file names — but only OUR group. Pid files live in the
+# bind-mounted home and survive a VM restart, so the number may since have
+# been handed to an unrelated process. Signal
+# the GROUP (chromium's children share the group setsid created and outlive
+# a crashed leader) only when it still has members AND the leader is either
+# what we started (its comm carries the prefix) or already gone — a dead
+# leader whose zygote/renderer children still hold the group is exactly the
+# failed launch do_start cleans up. A live leader with another name is a
+# recycled pid: the file is dropped and nothing is signalled.
+kill_group_file() {
+    local f="$1" want="$2" pid
+    [ -f "${f}" ] || return 0
+    pid="$(cat "${f}" 2>/dev/null || true)"
+    rm -f "${f}"
+    # 1–7 digits with no leading zero, and ≥ 2: the file is guest-writable;
+    # "0" would skip the comm check (/proc/0 never exists) while `pgrep -g 0`
+    # / `kill -- -0` mean the CALLER's own group, a zero-padded pid has no
+    # /proc entry yet resolves for pgrep/kill, and a number wider than int64
+    # would make `[` print a diagnostic into the launcher's output.
+    [[ "${pid}" =~ ^[1-9][0-9]{0,6}$ ]] && [ "${pid}" -ge 2 ] || return 0
+    if [ -d "/proc/${pid}" ] && ! comm_is "${pid}" "${want}"; then
+        echo "${f} named pid ${pid}, which is not ${want}: stale, not signalled" >&2
+        return 0
+    fi
+    pgrep -g "${pid}" >/dev/null 2>&1 || return 0
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+    for _ in $(seq 1 10); do
+        pgrep -g "${pid}" >/dev/null 2>&1 || break
+        sleep 0.5
+    done
+    kill -KILL -- "-${pid}" 2>/dev/null || true
+}
+
+do_stop() {
+    kill_group_file "${SOCATPID}" socat
+    rm -f "${SOCATRANGE}"
+    kill_group_file "${PIDFILE}" chrom
+    return 0
+}
+
+do_status() {
+    v="$(version_of)"
+    if [ -n "${v}" ]; then
+        jq -cn --arg v "${v}" '{running:true,version:$v}'
+    else
+        echo '{"running":false}'
+    fi
+}
+
+do_mcp() {
+    # stdout is the MCP stdio channel: nothing but the server may write to it.
+    if ! do_start >&2; then
+        echo "crew-browser: the browser did not start" >&2
+        exit 1
+    fi
+    # 9>&-: do_start opened the start lock on fd 9 in THIS shell; an exec
+    # without closing it would hand the lock to the MCP server for its whole
+    # life, and the pane's next `start` would wait 20 s and fail.
+    exec chrome-devtools-mcp --browserUrl "http://127.0.0.1:${CHROME_PORT}" 9>&-
+}
+
+case "${1:-}" in
+    start)  do_start ;;
+    stop)   do_stop ;;
+    status) do_status ;;
+    mcp)    do_mcp ;;
+    *) echo "usage: crew-browser start|stop|status|mcp" >&2; exit 2 ;;
+esac

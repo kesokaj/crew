@@ -1,0 +1,6 @@
+FROM scratch
+COPY hello.txt /hello.txt
+COPY hello.txt /data/seed.txt
+VOLUME /cache
+EXPOSE 9999
+CMD ["/hello.txt"]

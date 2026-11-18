@@ -1,0 +1,118 @@
+version: 1
+project: example
+key: EX                        # the prefix of ticket numbers: EX-1, EX-2
+planning:
+  rewrite: inherit             # kept for later use: since 0.32 a proposal by itself is made only for a plan draft, which has no project (7.2)
+hosting:                       # how this project is hosted on the machine (section 19)
+  dockerfile: Dockerfile       # or compose: compose.yaml
+  port: 8080
+  health: /healthz
+  data: /data                  # where the data directory is mounted
+  size: small
+  access: private              # private | listed | google | public
+  internet: true               # the hosted project may reach the internet from inside
+  allowed: []                  # the Google mail addresses for access: listed
+  hostname: null               # an own domain, beside <project>.<apps domain>
+  public_rps: 20               # requests per second from one address, for access: public
+  log_days: 14
+  data_copies: 3               # copies of the data directory kept, one made before each deploy
+  follow_main: false           # true: once a ticket reaches Done, deploy main's head, one deploy at a time
+approvals:
+  project: operator            # the plan and its breakdown
+  created_task: agent          # tasks agents create that fit the plan, and fixes
+  new_feature: notice          # notice (go ahead after new_feature_wait_hours) | operator | agent
+  new_feature_wait_hours: 24
+  agent_change: auto           # overrides the curator proposes: auto (applied when the evals are not worse; a checking role always waits) | operator
+  feature_specs: autonomous    # autonomous (@planner decides within 000-foundation.md and 13.8) | manual
+limits:
+  max_active_tickets: 4        # tickets of this project with active runs at once (7.9, R52)
+  run_timeout_minutes: 60
+  run_max_turns: 200
+  max_goal_rounds: 5           # check-and-continue rounds inside one run
+  check_timeout_minutes: 30    # a check that runs longer ends as an error, not as a failure (13.9)
+  max_fix_rounds: 3            # fix rounds on one ticket before the curator looks at it again
+  max_ticket_failures: 6       # fix rounds and stopped subtasks on one ticket since its last hold release before Crew holds it (7.7)
+  max_added_share: 0.25        # work agents may add, as a share of the tickets of the approved plan
+  max_added_tickets: 10        # open tickets agents may add on a project with no plan tickets (0 disables; 7.7)
+  max_added_subtasks: 6        # create_subtask calls on one ticket (7.5); the backend's join subtasks do not count
+  max_parallel_subtasks: 3     # subtasks of one ticket that may run at once (7.11)
+watchdog:
+  silent_warn_minutes: 5
+  silent_stop_minutes: 15
+  repeat_fail_warn: 3
+  repeat_fail_stop: 6
+  slow_stage_factor: 3
+agents:                        # this project's own model, with its CLI, or effort for a role; empty means the machine's entry, which is Crew's choice or yours (12.3). A ticket can pin again.
+  builder: {effort: low}       # an example: this project's builders think less
+  reviewer: {model: agy/claude-opus-5-5}   # an example: this project's reviews run on Claude Opus
+  # checks_use_another_family: false     # only when this project should allow a check on the builder's family
+  # at_limit: wait                         # only when this project's runs should wait for their own group at a limit (12.7)
+
+sandbox:
+  cpus: 6                       # virtual CPUs for the project's warm microVM (crew-proj-<id>): 2 to 32 (13.3, 13.10)
+  memory_gb: 8                  # GiB of memory for the project's warm microVM: 2 to 64
+  disk_gb: 20                   # GiB of disk budget for the project's persistent /home/agent: 5 to 500
+  suspend_after_minutes: null   # idle minutes before ContainerPause (0% CPU); null uses crew.yaml (1 to 240)
+  stop_after_minutes: null      # idle minutes before stopping to 0 MB RAM; null uses crew.yaml (1 to 1440)
+  max_snapshots: null           # snapshots of /home/agent kept; null uses crew.yaml (1 to 50)
+  setup: "make setup"
+  test: "make test"            # the project's test command, run before a merge
+  network: inherit             # inherit | internet | model_only | lan
+  check_network: inherit       # the mode of its check sandboxes: inherit (the project's own) | internet | model_only | lan | sources (the package sources alone, no model: a check runs no agent)
+  github_read: []              # other repositories of yours that this project's sandboxes may read, beside its own (12.6)
+git:
+  remote: git@github.com:<owner>/example.git   # over SSH, or null for a local-only project
+  push: [main, task_branches]   # sub/* branches are never pushed to the remote
+  fetch_minutes: 10
+  merge: auto                  # auto | merge_commit | pull_request. auto: a pull request with a GitHub remote and gh signed in
+stages:                        # the five fixed stages, and the optional ones with "on"
+  - id: planning
+  - id: backlog
+  - id: analysis
+    role: curator
+    wip: 4
+    exit: [has_why_what_goal, has_check, analysis_approved]
+  - id: in_progress
+    role: builder
+    wip: 6
+    enter: [dependencies_done]
+    exit: [branch_pushed, has_commits, note_exists, task_cmd_checks_pass, task_judge_checks_pass, docs_done, skills_vendored]   # with Review off, also named_tests_kept (7.1); before Done, review_covers_head (7.4)
+  - id: review
+    optional: true
+    on: true
+    role: reviewer
+    wip: 4
+    exit: [review_verdict_approve]
+  - id: test
+    optional: true
+    on: true
+    role: tester
+    wip: 4
+    exit: [test_result_pass, task_checks_pass]
+  - id: e2e
+    optional: true
+    on: false                  # on when the plan asks for end-to-end tests
+    role: e2e
+    wip: 1
+    run: "make e2e"            # how the application is started and driven; exit code 3 means the application could not start (since 0.47)
+    exit: [e2e_result_pass]
+  - id: verification
+    optional: true
+    on: false                  # on when the plan asks for it
+    role: verifier
+    wip: 1
+    exit: [verify_pass]
+  - id: done
+    enter: [merges_and_passes_on_main]
+docs:
+  root: docs                   # where the pages are on main
+  changelog: CHANGELOG.md
+  required: true               # every task names the pages it updates, or gives a reason
+knowledge:
+  memory:
+    index_max_chars: 6000
+  feedback:
+    max_per_run: 3
+  evals:
+    repeats: 3                 # each case runs this often; the spread is the margin (10.5)
+    min_cases: 10              # fewer cases than this in the project is too little to tell

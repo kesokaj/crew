@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# crew-setup STEP: one step of Setup, run in the setup microVM in a terminal of the app (design
+# 12.6). The setup microVM exists only for signing in: no project and no agent runs in it. When the
+# step ends, Crew collects what it made from this home, by fixed names, and removes the microVM.
+#
+#   git     the name and mail address on every commit
+#   ssh     a new SSH key, or one you paste; its public half is shown, to add to GitHub
+#   gh      gh auth login, with a code in the browser; the login stays with the server
+#   gcloud  gcloud auth login, and gcloud auth application-default login
+#   agy     agy's sign-in, with your Google account
+set -uo pipefail
+trap 'printf "\n"; exit 130' INT
+
+BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RESET=$'\033[0m'
+ok()   { echo "  ${GREEN}✔${RESET} $*"; }
+note() { echo "  ${YELLOW}➜${RESET} $*"; }
+head_() { echo; echo "${BOLD}$*${RESET}"; }
+# What Crew collects is written here or at the tool's own fixed path; nothing else is read.
+OUT="${HOME}/.crew/setup"
+mkdir -p "${OUT}" && chmod 700 "${OUT}"
+
+ask() { # ask VAR PROMPT: one line, not empty
+    local v=""
+    while [ -z "${v}" ]; do read -rp "  $2 " v || exit 1; done
+    printf -v "$1" '%s' "${v}"
+}
+
+step_git() {
+    head_ "Git identity: the author of every commit"
+    local name email
+    ask name "your name:"
+    ask email "your mail address:"
+    git config --global user.name "${name}"
+    git config --global user.email "${email}"
+    ok "git identity: ${name} <${email}>"
+}
+
+step_ssh() {
+    head_ "Git SSH key: all git traffic with GitHub, by Crew. It stays with the server."
+    local comment choice
+    comment="$(git config --global user.email 2>/dev/null || echo crew)"
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    read -rp "  make a new key (n) or paste one you have (p)? [n/p] " choice || exit 1
+    if [ "${choice}" = "p" ]; then
+        note "paste the private key, then a line with only a dot (.)"
+        : > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+        local line
+        while IFS= read -r line && [ "${line}" != "." ]; do printf '%s\n' "${line}" >> ~/.ssh/id_ed25519; done
+        if ! ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/id_ed25519.pub 2>/dev/null; then
+            rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub
+            note "that is not a private key without a passphrase; nothing is kept"
+            exit 1
+        fi
+    else
+        rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub
+        ssh-keygen -q -t ed25519 -N "" -C "${comment}" -f ~/.ssh/id_ed25519
+    fi
+    ok "the key is made. Add its public half to your GitHub account, at https://github.com/settings/keys:"
+    echo
+    echo "    $(cat ~/.ssh/id_ed25519.pub)"
+    echo
+    note "Setup shows the public half too, after this step."
+}
+
+step_gh() {
+    head_ "gh: repositories, pull requests, and release pages. The login stays with the server."
+    note "gh prints a one-time code and a link: open the link, enter the code, approve."
+    # No keyring here, so gh keeps its login in ~/.config/gh/hosts.yml, which Crew collects.
+    # write:packages lets the server publish release images to GitHub's registry (16.12); the
+    # default scopes cannot (section 24, item 32).
+    # There is no browser in the microVM: GH_BROWSER=true makes gh's "open the browser" a quiet no-op,
+    # and the link and the code it prints are opened on the operator's own machine.
+    GH_BROWSER=true gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key --insecure-storage \
+        --scopes write:packages </dev/tty
+    gh auth status --hostname github.com >/dev/null 2>&1 && ok "gh is signed in as $(gh api user --jq .login 2>/dev/null)"
+}
+
+step_gcloud() {
+    head_ "gcloud: for the Google Cloud skills of the harness"
+    note "Sign gcloud in with an account meant for development, not one that can reach production (12.6)."
+    note "gcloud prints a link: open it, approve, and paste the code back. Then once more for the application default credentials."
+    gcloud auth login --no-launch-browser || exit 1
+    gcloud auth application-default login --no-launch-browser || exit 1
+    ok "gcloud: $(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null)"
+}
+
+step_agy() {
+    head_ "agy: the Antigravity CLI"
+    note "Sign in with your Google account. It should have no rights in a cloud project that matters:"
+    note "an agy login can call Google Cloud with them (design 12.6, spike item 27)."
+    note "agy prints a sign-in link: open it, approve, paste the code back. When agy is signed in, quit it (Ctrl+C twice)."
+    agy </dev/tty || true
+    if [ -s ~/.gemini/antigravity-cli/antigravity-oauth-token ]; then
+        ok "agy has its token file"
+    else
+        note "agy wrote no token file: it is not signed in"
+        exit 1
+    fi
+}
+
+case "${1:-}" in
+    git) step_git ;;
+    ssh) step_ssh ;;
+    gh) step_gh ;;
+    gcloud) step_gcloud ;;
+    agy) step_agy ;;
+    *) echo "usage: crew-setup git|ssh|gh|gcloud|agy" >&2; exit 2 ;;
+esac
+echo
+echo "${DIM}Done. Crew collects this now; this terminal closes.${RESET}"

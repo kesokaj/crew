@@ -1,0 +1,7 @@
+#!/bin/sh
+# ?write=NAME writes NAME into the data folder; then the folder's names, one a line.
+printf 'Content-Type: text/plain\r\n\r\n'
+case "$QUERY_STRING" in
+write=*) n="${QUERY_STRING#write=}"; case "$n" in *[!a-z0-9]*|"") ;; *) echo x > "/data/$n" ;; esac ;;
+esac
+ls /data

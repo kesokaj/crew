@@ -1,0 +1,35 @@
+## 27. References
+
+- styrman-crew (eight parts are copied from it, section 17), private: https://github.com/kesokaj/styrman-crew
+- styrman-harness (the harness Crew's own harness is copied from): https://github.com/kesokaj/styrman-harness
+- GitHub, personal access tokens, fine-grained and classic: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+- GitHub, the container registry and the tokens it accepts: https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry
+- GitHub CLI, `gh auth login`: https://cli.github.com/manual/gh_auth_login
+- GitHub, installation access tokens of a GitHub App: https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+- GitHub, deploy keys and their alternatives: https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys
+- Antigravity CLI, headless mode: https://antigravity.google/docs/cli/headless/
+- Antigravity, FAQ (what consumer plans support): https://antigravity.google/docs/faq/
+- Claude Code, models, their aliases, and efforts: https://code.claude.com/docs/en/model-config
+- Claude Agent SDK, `supportedModels()` and the `initialize` request: https://code.claude.com/docs/en/agent-sdk/typescript
+- Antigravity, models, the two groups of limits, and plans: https://antigravity.google/docs/models/ and https://antigravity.google/docs/plans/
+- A list of the names `agy models` prints, published by a user (not from the vendor): https://github.com/pingdotgg/t3code/issues/15378
+- Kata Containers 4.0.0, release notes (Docker is tested with QEMU only; the older runtime is on its way out): https://github.com/kata-containers/kata-containers/releases/tag/4.0.0
+- Kata Containers 4.3.0 and 4.3.1, release notes (two security fixes in 4.3.0): https://github.com/kata-containers/kata-containers/releases/tag/4.3.1
+- Kata Containers, how to use Kata with Docker (the Go runtime; Docker tested with QEMU only): https://github.com/kata-containers/kata-containers/blob/4.3.1/docs/how-to/how-to-use-kata-with-docker.md
+- Kata Containers, sizing a sandbox with runtime-rs (`overhead_vcpus`, `overhead_memory`): https://github.com/kata-containers/kata-containers/blob/4.3.1/docs/how-to/how-to-size-sandbox-overhead-runtime-rs.md
+- Kata Containers, security advisories: https://github.com/kata-containers/kata-containers/security/advisories
+- Antigravity CLI, changelog (reading the limits with `/usage`, exit code 3): https://antigravity.google/docs/changelog/
+- Antigravity, terms of service: https://antigravity.google/terms
+- Kata Containers, hypervisors: https://github.com/kata-containers/kata-containers/blob/main/docs/hypervisors.md
+- Docker, alternative container runtimes: https://docs.docker.com/engine/daemon/alternative-runtimes/
+- PostgreSQL, `pg_dump`: https://www.postgresql.org/docs/current/app-pgdump.html
+- PostgreSQL, table partitioning: https://www.postgresql.org/docs/current/ddl-partitioning.html
+- Parallel change (expand and contract): https://martinfowler.com/bliki/ParallelChange.html
+- Home Assistant, update system (automatic roll back): https://developers.home-assistant.io/docs/operating-system/update-system/
+- Google Chat, incoming webhooks (needs a Business or Enterprise Workspace account): https://developers.google.com/workspace/chat/quickstart/webhooks
+- Google Account, app passwords: https://support.google.com/accounts/answer/185833
+- Push API (notifications from a web app): https://developer.mozilla.org/en-US/docs/Web/API/Push_API
+- WebKit, Web Push for web apps on iOS and iPadOS: https://webkit.org/blog/13878/web-push-for-web-apps-on-ios-and-ipados/
+- Apple developer forum, notification actions on iOS: https://developer.apple.com/forums/thread/726793
+- Google, OAuth 2.0 and when a sign-in runs out: https://developers.google.com/identity/protocols/oauth2
+- Web apps on iOS, what works: https://www.magicbell.com/blog/pwa-ios-limitations-safari-support-complete-guide

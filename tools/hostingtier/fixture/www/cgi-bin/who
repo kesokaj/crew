@@ -1,0 +1,5 @@
+#!/bin/sh
+# What the request carried: the signed-in address the ingress passed, and the cookies the app got.
+printf 'Content-Type: text/plain\r\nSet-Cookie: app=1; Domain=apps.test; Path=/\r\n\r\n'
+printf 'email=%s\n' "$HTTP_X_CADDY_EMAIL"
+printf 'cookie=%s\n' "$HTTP_COOKIE"

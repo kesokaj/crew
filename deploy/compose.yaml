@@ -1,0 +1,282 @@
+# Crew's core services (design 13.1). crew-ctl runs this file as the project "crew", with the
+# install file and versions.lock as its env files, and with CREW_VERSION, CREW_UID, and CREW_GID set:
+#   docker compose -p crew -f compose.yaml --env-file versions.lock --env-file /etc/crew/crew.env ...
+# Every container runs as the system user crew, and each mounts only its own folder of the data
+# folder: the server cannot read the database's files or the ingress's keys. Secrets are files in
+# /etc/crew/secrets, given to the containers that need them as Docker secrets.
+name: crew
+
+x-logging: &logging
+  driver: json-file
+  options: {max-size: "50m", max-file: "3"}
+
+services:
+  crew-db:
+    container_name: crew-db
+    image: ${POSTGRES_IMAGE:?versions.lock names the database image}
+    user: "${CREW_UID:?}:${CREW_GID:?}"
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_postgres
+      PGDATA: /var/lib/postgresql/data
+    secrets: [db_postgres, db_crew, db_crew_migrate, db_crew_read]
+    volumes:
+      - ${CREW_DATA_DIR:-/var/lib/crew}/db:/var/lib/postgresql
+      - ./db/10-roles.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro
+    # Only the server and crew admin reach it, on a network with no way out. It has no port on the
+    # machine (15.3).
+    networks: [crew-db]
+    shm_size: 256m
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "pg_isready", "-q", "-h", "127.0.0.1", "-d", "crew", "-U", "crew"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    logging: *logging
+
+  crew-server:
+    container_name: crew-server
+    image: crew-server:${CREW_VERSION:?}
+    user: "${CREW_UID:?}:${CREW_GID:?}"
+    environment:
+      CREW_HOSTNAME: ${CREW_HOSTNAME:?}
+      # Hosted projects' addresses are under it (19.4); empty, nothing is hosted.
+      CREW_APPS_DOMAIN: ${CREW_APPS_DOMAIN:-}
+      CREW_ADMIN_EMAIL: ${CREW_ADMIN_EMAIL:?}
+      CREW_SOURCE_REPO: ${CREW_SOURCE_REPO:-}
+      CREW_TIMEZONE: ${CREW_TIMEZONE:-}
+      CREW_TLS: ${CREW_TLS:-acme}
+      CREW_DATA_DIR: ${CREW_DATA_DIR:-/var/lib/crew}
+      TZ: ${CREW_TIMEZONE:-UTC}
+      # The sandboxes: the runtime image of this version, started with Kata, each on a bridge the
+      # server joins under its own container name (13.3).
+      CREW_RUNTIME_IMAGE: crew-runtime:${CREW_VERSION:?}
+      CREW_SELF_CONTAINER: crew-server
+      # The ingress, which the server joins to each hosted project's bridge (19.4).
+      CREW_INGRESS_CONTAINER: crew-caddy
+      # The name the ingress reaches the server by, on crew-ingress alone: the ingress's door answers
+      # only that network and the loopback (13.6, 20.3).
+      CREW_DOOR_NAME: crew-server-door
+      # The operator's documented way past the forwarding guard (13.6): empty by default, set to 1 in
+      # the server's environment only to let a server whose netns forwards start sandboxes anyway.
+      CREW_ALLOW_IP_FORWARD: ${CREW_ALLOW_IP_FORWARD:-}
+    secrets: [db_crew, db_crew_read, ingress_token, secret_key]
+    # The server holds the Docker socket, as the updater will (13.8); no sandbox and not the ingress
+    # does. Its group is the socket's, which crew-ctl reads; no account is put in the docker group.
+    group_add: ["${CREW_DOCKER_GID:?}"]
+    volumes:
+      # The same path as on the machine, so the paths the server writes mean the same on both, and
+      # to Docker: the backups, the sandboxes' homes, the git endpoint's quarantine repositories,
+      # and the canonical ones that no sandbox reaches (6.1), never db/ or caddy/.
+      - ${CREW_DATA_DIR:-/var/lib/crew}/backups:${CREW_DATA_DIR:-/var/lib/crew}/backups
+      - ${CREW_DATA_DIR:-/var/lib/crew}/sandboxes:${CREW_DATA_DIR:-/var/lib/crew}/sandboxes
+      - ${CREW_DATA_DIR:-/var/lib/crew}/repos:${CREW_DATA_DIR:-/var/lib/crew}/repos
+      - ${CREW_DATA_DIR:-/var/lib/crew}/canonical:${CREW_DATA_DIR:-/var/lib/crew}/canonical
+      # The hosted projects' data, its copies and their logs (19.3): the server binds a project's data/
+      # into its microVM, so the path is the machine's.
+      - ${CREW_DATA_DIR:-/var/lib/crew}/hosted:${CREW_DATA_DIR:-/var/lib/crew}/hosted
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The release folders, read only, and the updater's socket (16.4): the server asks it to install.
+      - ${CREW_DATA_DIR:-/var/lib/crew}/releases:${CREW_DATA_DIR:-/var/lib/crew}/releases:ro
+      - /run/crew:/run/crew
+      # The files a build of a release copied out of its check sandbox, until the updater loads
+      # them (16.2 step 4).
+      - ${CREW_DATA_DIR:-/var/lib/crew}/builds:${CREW_DATA_DIR:-/var/lib/crew}/builds
+    # The ingress reaches the server by a name that is on crew-ingress alone: the server is also on
+    # every hosted project's bridge, where its own name could answer with that bridge's address (19.4).
+    networks:
+      crew-db: {}
+      crew-ingress: {aliases: [crew-server-door]}
+      crew-out: {}
+    # Two public resolvers, as styrman-crew's ingress and Crew's sandboxes have (13.6): when Docker
+    # restores the containers at boot before DHCP writes /etc/resolv.conf, its embedded resolver
+    # (127.0.0.11) still has external nameservers while keeping container names on the bridges.
+    dns: [8.8.8.8, 1.1.1.1]
+    # The server joins every sandbox's bridge, and routes nothing between them, nor out of one (13.6):
+    # it starts no sandbox when its network forwards (cmd/crew/machine.go).
+    sysctls:
+      net.ipv4.ip_forward: "0"
+    # A ceiling on the server and everything it starts, the git endpoint's pushes and fetches among
+    # them: a full server stops the endpoint's git, whose score is raised, before the server, within
+    # the machine's reserve, which holds it with the database's and the ingress's (6.1, 13.10; since
+    # 1.08).
+    mem_limit: 4g
+    # No swap beyond it, on a machine that has swap.
+    memswap_limit: 4g
+    depends_on:
+      crew-db: {condition: service_healthy}
+    restart: unless-stopped
+    logging: *logging
+
+  crew-caddy:
+    container_name: crew-caddy
+    image: crew-caddy:${CREW_VERSION:?}
+    user: "${CREW_UID:?}:${CREW_GID:?}"
+    # The ingress reads its secrets from files, and passes nothing on to the server but the shared
+    # one (19.4). It holds no Docker socket.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        CREW_INGRESS_TOKEN=$$(cat /run/secrets/ingress_token)
+        CREW_JWT_KEY=$$(cat /run/secrets/jwt_key)
+        GOOGLE_CLIENT_SECRET=$$(cat /run/secrets/google_client_secret)
+        CLOUDFLARE_API_TOKEN=$$(cat /run/secrets/cloudflare_api_token)
+        exec caddy ingress
+    environment:
+      BASE_DOMAIN: ${CREW_HOSTNAME:?}
+      ADMIN_EMAIL: ${CREW_ADMIN_EMAIL:?}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      # Hosted projects' addresses are under another registered domain than Crew's (19.4).
+      APPS_DOMAIN: ${CREW_APPS_DOMAIN:-}
+      CREW_TLS: ${CREW_TLS:-acme}
+      CREW_SERVER_ADDR: crew-server-door:8080
+      XDG_DATA_HOME: /data
+      XDG_CONFIG_HOME: /config
+    secrets: [ingress_token, jwt_key, google_client_secret, cloudflare_api_token]
+    ports: ["80:80", "443:443"]
+    # A user that is not root may bind 80 and 443 inside this container's own network namespace. It
+    # joins every hosted project's bridge, and routes nothing between them (13.6).
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+      net.ipv4.ip_forward: "0"
+    volumes:
+      - ${CREW_DATA_DIR:-/var/lib/crew}/caddy/data:/data
+      - ${CREW_DATA_DIR:-/var/lib/crew}/caddy/config:/config
+    networks: [crew-ingress, crew-out]
+    dns: [8.8.8.8, 1.1.1.1]
+    depends_on: [crew-server]
+    mem_limit: 1g
+    restart: unless-stopped
+    logging: *logging
+
+  # crew admin, for what crew-ctl passes on: migrate and restore, which need the role that owns the
+  # schema. It runs only when crew-ctl asks for it, and ends with its command.
+  crew-admin:
+    image: crew-server:${CREW_VERSION:?}
+    profiles: [admin]
+    user: "${CREW_UID:?}:${CREW_GID:?}"
+    environment:
+      CREW_HOSTNAME: ${CREW_HOSTNAME:?}
+      CREW_ADMIN_EMAIL: ${CREW_ADMIN_EMAIL:?}
+      CREW_SOURCE_REPO: ${CREW_SOURCE_REPO:-}
+      CREW_DATA_DIR: ${CREW_DATA_DIR:-/var/lib/crew}
+      TZ: ${CREW_TIMEZONE:-UTC}
+    secrets: [db_crew, db_crew_read, db_crew_migrate]
+    volumes:
+      - ${CREW_DATA_DIR:-/var/lib/crew}/backups:${CREW_DATA_DIR:-/var/lib/crew}/backups
+      # The updater's snapshots (16.4), and the repositories of projects with no remote, which the
+      # daily backup holds and a restore puts back where they are missing (16.9).
+      - ${CREW_DATA_DIR:-/var/lib/crew}/updater/snapshots:${CREW_DATA_DIR:-/var/lib/crew}/updater/snapshots
+      - ${CREW_DATA_DIR:-/var/lib/crew}/canonical:${CREW_DATA_DIR:-/var/lib/crew}/canonical
+    networks: [crew-db]
+    logging: *logging
+
+  # The updater (16.4): it installs a release and rolls one back, and is the only thing that replaces
+  # a core service while Crew runs. It holds the Docker socket, as the server does, and runs Compose
+  # with these files, so it is root in its container, which the socket gives anyway. It reads the
+  # install file and /etc/crew, and writes only the release folders and its own folder. It has no
+  # network: it reaches Docker over the socket and is reached over its own, which only root and the
+  # server's container can open (16.11). The server installs a new updater; it never replaces itself.
+  crew-updater:
+    container_name: crew-updater
+    image: crew-updater:${CREW_UPDATER_VERSION:-${CREW_VERSION:?}}
+    user: "0:0"
+    environment:
+      CREW_VERSION: ${CREW_VERSION:?}
+      CREW_UID: ${CREW_UID:?}
+      CREW_GID: ${CREW_GID:?}
+      CREW_DOCKER_GID: ${CREW_DOCKER_GID:?}
+      CREW_ETC: ${CREW_ETC:-/etc/crew}
+      CREW_DATA_DIR: ${CREW_DATA_DIR:-/var/lib/crew}
+      CREW_LIB_DIR: /usr/local/lib/crew
+      TZ: ${CREW_TIMEZONE:-UTC}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/local/lib/crew:/usr/local/lib/crew:ro
+      - ${CREW_ETC:-/etc/crew}:${CREW_ETC:-/etc/crew}:ro
+      - ${CREW_DATA_DIR:-/var/lib/crew}/releases:${CREW_DATA_DIR:-/var/lib/crew}/releases
+      - ${CREW_DATA_DIR:-/var/lib/crew}/updater:${CREW_DATA_DIR:-/var/lib/crew}/updater
+      - /run/crew:/run/crew
+      # A build's files, which it copies into a release folder of its own and checks (16.2 step 4).
+      - ${CREW_DATA_DIR:-/var/lib/crew}/builds:${CREW_DATA_DIR:-/var/lib/crew}/builds:ro
+    network_mode: none
+    restart: unless-stopped
+    logging: *logging
+
+  # The scratch copy a release is tried on (16.4, step 3): a database server of its own, on a network
+  # of its own, with passwords the updater makes for each check. Nothing of the running database's is
+  # given to the release that is checked: not its files, not its passwords, not its network.
+  crew-db-check:
+    container_name: crew-db-check
+    image: ${POSTGRES_IMAGE:?versions.lock names the database image}
+    profiles: [check]
+    user: "${CREW_UID:?}:${CREW_GID:?}"
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_postgres
+      PGDATA: /var/lib/postgresql/data
+    secrets:
+      - {source: check_db_postgres, target: db_postgres}
+      - {source: check_db_crew, target: db_crew}
+      - {source: check_db_crew_migrate, target: db_crew_migrate}
+      - {source: check_db_crew_read, target: db_crew_read}
+    volumes:
+      - ${CREW_DATA_DIR:-/var/lib/crew}/updater/check/db:/var/lib/postgresql
+      - ./db/10-roles.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro
+    networks: [crew-scratch]
+    shm_size: 256m
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "pg_isready", "-q", "-h", "127.0.0.1", "-d", "crew", "-U", "crew"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    logging: *logging
+
+networks:
+  # The database's network has no way out of the machine.
+  crew-db:
+    name: crew-db
+    internal: true
+  crew-ingress:
+    name: crew-ingress
+    internal: true
+  # The way out, for the ingress (certificates, DNS, the sign-in) and for the server (GitHub, later).
+  crew-out:
+    name: crew-out
+  # The check's own network, with no way out: the scratch copy and the release that is checked. Not
+  # crew-check, which make check's own test database uses.
+  crew-scratch:
+    name: crew-scratch
+    internal: true
+
+secrets:
+  db_postgres:
+    file: "${CREW_ETC:-/etc/crew}/secrets/db_postgres"
+  db_crew:
+    file: "${CREW_ETC:-/etc/crew}/secrets/db_crew"
+  db_crew_migrate:
+    file: "${CREW_ETC:-/etc/crew}/secrets/db_crew_migrate"
+  db_crew_read:
+    file: "${CREW_ETC:-/etc/crew}/secrets/db_crew_read"
+  ingress_token:
+    file: "${CREW_ETC:-/etc/crew}/secrets/ingress_token"
+  jwt_key:
+    file: "${CREW_ETC:-/etc/crew}/secrets/jwt_key"
+  google_client_secret:
+    file: "${CREW_ETC:-/etc/crew}/secrets/google_client_secret"
+  cloudflare_api_token:
+    file: "${CREW_ETC:-/etc/crew}/secrets/cloudflare_api_token"
+  # The key that seals the credentials in the database (15.3). It is in no backup.
+  secret_key:
+    file: "${CREW_ETC:-/etc/crew}/secret.key"
+  # The check's own (16.4): made by the updater for each check, in its folder, and removed after it.
+  check_db_postgres:
+    file: "${CREW_DATA_DIR:-/var/lib/crew}/updater/check/secrets/db_postgres"
+  check_db_crew:
+    file: "${CREW_DATA_DIR:-/var/lib/crew}/updater/check/secrets/db_crew"
+  check_db_crew_migrate:
+    file: "${CREW_DATA_DIR:-/var/lib/crew}/updater/check/secrets/db_crew_migrate"
+  check_db_crew_read:
+    file: "${CREW_DATA_DIR:-/var/lib/crew}/updater/check/secrets/db_crew_read"

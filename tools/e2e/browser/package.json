@@ -1,0 +1,7 @@
+{
+  "name": "crew-e2e-browser",
+  "private": true,
+  "description": "Crew's browser tests: the UI and the API through the real ingress, on an installation with CREW_TLS=internal",
+  "scripts": { "test": "playwright test" },
+  "devDependencies": { "@playwright/test": "1.64.0" }
+}

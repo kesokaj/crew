@@ -1,0 +1,22 @@
+# What a build of an image may read from the checkout. Secrets never: the install file and the
+# spike's raw recordings stay out of every build context.
+.git
+.agents
+.claude
+.env
+.env.*
+*.env
+*.pem
+*.key
+crew.env
+secret.key
+secrets
+!.env.example
+.check
+spike
+docs
+testdata
+web/node_modules
+web/dist
+web/src/routeTree.gen.ts
+**/*_test.go

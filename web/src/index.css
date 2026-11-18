@@ -1,0 +1,113 @@
+@import "tailwindcss";
+@import "./styles/themes-40.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--primary);
+  --color-accent-foreground: var(--primary-foreground);
+  --color-destructive: var(--destructive);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-success: var(--success, #2f7d4a);
+  --color-warning: var(--warning, #f0b04c);
+  --color-info: var(--info, #1d5fa8);
+
+  /* Semantic tokens mapped across every existing and M25 component for all 40 themes. */
+  --color-bg: var(--background);
+  --color-bg-raised: var(--card);
+  --color-bg-sunk: var(--muted);
+  --color-border: var(--border);
+  --color-text: var(--foreground);
+  --color-text-dim: var(--muted-foreground);
+  --color-accent-soft: color-mix(in oklab, var(--primary) 16%, var(--card));
+  --color-amber: var(--warning, #f0b04c);
+  --color-amber-soft: color-mix(in oklab, var(--warning, #f0b04c) 18%, var(--card));
+  --color-amber-text: var(--foreground);
+  --color-ok: var(--success, #2f7d4a);
+  --color-bad: var(--destructive);
+  --color-term: #121417;
+
+  --radius-sm: calc(var(--radius, 0.625rem) * 0.6);
+  --radius-md: calc(var(--radius, 0.625rem) * 0.8);
+  --radius-lg: var(--radius, 0.625rem);
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: Inter, system-ui, sans-serif;
+  color-scheme: light dark;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--color-border);
+  border-radius: 4px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-text-dim);
+}
+
+/* A documentation page, as its markdown renders (9.9, docs.png). */
+.markdown h1 { font-size: 1.5rem; font-weight: 600; margin: 0.25rem 0 0.75rem; }
+.markdown h2 { font-size: 1.15rem; font-weight: 600; margin: 1.25rem 0 0.5rem; }
+.markdown h3 { font-size: 1rem; font-weight: 600; margin: 1rem 0 0.4rem; }
+.markdown p { margin: 0.5rem 0; line-height: 1.6; }
+.markdown ul { list-style: disc; padding-left: 1.4rem; margin: 0.5rem 0; }
+.markdown ol { list-style: decimal; padding-left: 1.4rem; margin: 0.5rem 0; }
+.markdown li { margin: 0.2rem 0; }
+.markdown a { color: var(--color-accent); text-decoration: underline; }
+.markdown code { font-family: var(--font-mono); font-size: 0.85em; background: var(--color-bg-sunk); padding: 0.05rem 0.25rem; border-radius: 0.2rem; }
+.markdown pre { background: var(--color-bg-sunk); border: 1px solid var(--color-border); border-radius: 0.375rem; padding: 0.75rem; overflow-x: auto; margin: 0.75rem 0; }
+.markdown pre code { background: none; padding: 0; }
+.markdown table { border-collapse: collapse; margin: 0.75rem 0; font-size: 0.875rem; }
+.markdown th, .markdown td { border: 1px solid var(--color-border); padding: 0.25rem 0.5rem; text-align: left; }
+.markdown blockquote { border-left: 3px solid var(--color-border); padding-left: 0.75rem; color: var(--color-text-dim); }
+
+/* Mobile keyboard resize & smooth pan/zoom inside project chat rooms (20.2). */
+.crew-chat-viewport {
+  touch-action: pan-y pinch-zoom;
+}
+.crew-chat-viewport[data-kb-open="true"] {
+  padding-bottom: 0.5rem;
+}
